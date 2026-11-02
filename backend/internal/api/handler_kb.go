@@ -8,9 +8,9 @@ import (
 	"io"
 	"net/http"
 
-	"github.com/chengpeng-cp/nexus-agent/internal/model"
-	"github.com/chengpeng-cp/nexus-agent/internal/pkg/errcode"
-	"github.com/chengpeng-cp/nexus-agent/internal/service"
+	"github.com/Emulisy/SupaAgent/internal/model"
+	"github.com/Emulisy/SupaAgent/internal/pkg/errcode"
+	"github.com/Emulisy/SupaAgent/internal/service"
 )
 
 // ListKBs returns the current user's knowledge bases with pagination metadata.

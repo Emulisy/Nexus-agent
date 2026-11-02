@@ -9,9 +9,9 @@ import (
 	"net/http"
 	"strconv"
 
-	"github.com/chengpeng-cp/nexus-agent/internal/logging"
-	"github.com/chengpeng-cp/nexus-agent/internal/pkg/errcode"
-	"github.com/chengpeng-cp/nexus-agent/internal/pkg/pagination"
+	"github.com/Emulisy/SupaAgent/internal/logging"
+	"github.com/Emulisy/SupaAgent/internal/pkg/errcode"
+	"github.com/Emulisy/SupaAgent/internal/pkg/pagination"
 )
 
 // envelope carries a stable application code alongside the HTTP status.

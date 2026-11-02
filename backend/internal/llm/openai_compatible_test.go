@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/chengpeng-cp/nexus-agent/internal/pkg/errcode"
+	"github.com/Emulisy/SupaAgent/internal/pkg/errcode"
 )
 
 func TestModelTimeoutIsNotInternalError(t *testing.T) {

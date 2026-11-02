@@ -7,7 +7,7 @@ import (
 	"io"
 	"net/http"
 
-	"github.com/chengpeng-cp/nexus-agent/internal/service"
+	"github.com/Emulisy/SupaAgent/internal/service"
 )
 
 // ChatReq selects the session, agent, and optional model for a single turn.

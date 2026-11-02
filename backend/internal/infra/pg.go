@@ -12,8 +12,8 @@ import (
 	"gorm.io/gorm"
 	gormlogger "gorm.io/gorm/logger"
 
-	"github.com/chengpeng-cp/nexus-agent/internal/config"
-	"github.com/chengpeng-cp/nexus-agent/internal/logging"
+	"github.com/Emulisy/SupaAgent/internal/config"
+	"github.com/Emulisy/SupaAgent/internal/logging"
 )
 
 // NewPG opens GORM with the configured PostgreSQL DSN, applies SQL pool limits,

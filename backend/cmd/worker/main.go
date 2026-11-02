@@ -11,16 +11,16 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/chengpeng-cp/nexus-agent/internal/config"
-	"github.com/chengpeng-cp/nexus-agent/internal/infra"
-	"github.com/chengpeng-cp/nexus-agent/internal/llm"
-	"github.com/chengpeng-cp/nexus-agent/internal/logging"
-	"github.com/chengpeng-cp/nexus-agent/internal/rag/engine"
-	"github.com/chengpeng-cp/nexus-agent/internal/repo"
-	"github.com/chengpeng-cp/nexus-agent/internal/security"
-	"github.com/chengpeng-cp/nexus-agent/internal/service"
-	"github.com/chengpeng-cp/nexus-agent/internal/vector"
-	"github.com/chengpeng-cp/nexus-agent/internal/worker"
+	"github.com/Emulisy/SupaAgent/internal/config"
+	"github.com/Emulisy/SupaAgent/internal/infra"
+	"github.com/Emulisy/SupaAgent/internal/llm"
+	"github.com/Emulisy/SupaAgent/internal/logging"
+	"github.com/Emulisy/SupaAgent/internal/rag/engine"
+	"github.com/Emulisy/SupaAgent/internal/repo"
+	"github.com/Emulisy/SupaAgent/internal/security"
+	"github.com/Emulisy/SupaAgent/internal/service"
+	"github.com/Emulisy/SupaAgent/internal/vector"
+	"github.com/Emulisy/SupaAgent/internal/worker"
 )
 
 // main reports worker initialization or processing errors and exits unsuccessfully.

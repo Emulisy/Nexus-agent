@@ -13,11 +13,11 @@ import (
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
 
-	"github.com/chengpeng-cp/nexus-agent/internal/model"
-	"github.com/chengpeng-cp/nexus-agent/internal/pkg/errcode"
-	"github.com/chengpeng-cp/nexus-agent/internal/pkg/pagination"
-	"github.com/chengpeng-cp/nexus-agent/internal/security"
-	"github.com/chengpeng-cp/nexus-agent/internal/workflow"
+	"github.com/Emulisy/SupaAgent/internal/model"
+	"github.com/Emulisy/SupaAgent/internal/pkg/errcode"
+	"github.com/Emulisy/SupaAgent/internal/pkg/pagination"
+	"github.com/Emulisy/SupaAgent/internal/security"
+	"github.com/Emulisy/SupaAgent/internal/workflow"
 )
 
 // WorkflowService shares repositories and receives an engine after the application dependencies are assembled.

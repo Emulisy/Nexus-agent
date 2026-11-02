@@ -9,8 +9,8 @@ import (
 
 	"gorm.io/datatypes"
 
-	"github.com/chengpeng-cp/nexus-agent/internal/model"
-	"github.com/chengpeng-cp/nexus-agent/internal/vector"
+	"github.com/Emulisy/SupaAgent/internal/model"
+	"github.com/Emulisy/SupaAgent/internal/vector"
 )
 
 // FusedChunk retains the source record and filename while replacing raw dense or

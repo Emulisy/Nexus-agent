@@ -10,7 +10,7 @@ import (
 
 	"gorm.io/gorm"
 
-	"github.com/chengpeng-cp/nexus-agent/internal/model"
+	"github.com/Emulisy/SupaAgent/internal/model"
 )
 
 // SessionRepo manages session/message tables through the shared GORM handle.

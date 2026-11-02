@@ -13,7 +13,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/chengpeng-cp/nexus-agent/internal/pkg/errcode"
+	"github.com/Emulisy/SupaAgent/internal/pkg/errcode"
 )
 
 type jsonRPCRequest struct {

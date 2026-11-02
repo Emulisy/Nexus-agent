@@ -10,12 +10,12 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/chengpeng-cp/nexus-agent/internal/agent"
-	agenttrace "github.com/chengpeng-cp/nexus-agent/internal/agent/trace"
-	"github.com/chengpeng-cp/nexus-agent/internal/llm"
-	"github.com/chengpeng-cp/nexus-agent/internal/logging"
-	"github.com/chengpeng-cp/nexus-agent/internal/pkg/errcode"
-	"github.com/chengpeng-cp/nexus-agent/internal/tool"
+	"github.com/Emulisy/SupaAgent/internal/agent"
+	agenttrace "github.com/Emulisy/SupaAgent/internal/agent/trace"
+	"github.com/Emulisy/SupaAgent/internal/llm"
+	"github.com/Emulisy/SupaAgent/internal/logging"
+	"github.com/Emulisy/SupaAgent/internal/pkg/errcode"
+	"github.com/Emulisy/SupaAgent/internal/tool"
 )
 
 // Runner starts one execution and returns an event stream owned by the implementation.

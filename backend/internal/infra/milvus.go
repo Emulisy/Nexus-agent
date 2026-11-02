@@ -9,7 +9,7 @@ import (
 	"github.com/milvus-io/milvus-sdk-go/v2/client"
 	"github.com/milvus-io/milvus-sdk-go/v2/entity"
 
-	"github.com/chengpeng-cp/nexus-agent/internal/config"
+	"github.com/Emulisy/SupaAgent/internal/config"
 )
 
 // NewMilvus connects through the SDK using the configured gRPC address.

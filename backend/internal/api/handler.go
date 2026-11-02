@@ -7,9 +7,9 @@ import (
 	"net/http"
 	"strconv"
 
-	"github.com/chengpeng-cp/nexus-agent/internal/pkg/errcode"
-	"github.com/chengpeng-cp/nexus-agent/internal/security"
-	"github.com/chengpeng-cp/nexus-agent/internal/service"
+	"github.com/Emulisy/SupaAgent/internal/pkg/errcode"
+	"github.com/Emulisy/SupaAgent/internal/security"
+	"github.com/Emulisy/SupaAgent/internal/service"
 )
 
 // Handler holds application services used by the registered HTTP endpoints.

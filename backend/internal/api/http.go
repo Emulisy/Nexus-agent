@@ -6,8 +6,8 @@ import (
 	"io"
 	"net/http"
 
-	"github.com/chengpeng-cp/nexus-agent/internal/agent"
-	"github.com/chengpeng-cp/nexus-agent/internal/pkg/errcode"
+	"github.com/Emulisy/SupaAgent/internal/agent"
+	"github.com/Emulisy/SupaAgent/internal/pkg/errcode"
 )
 
 const maxJSONBody = 4 << 20

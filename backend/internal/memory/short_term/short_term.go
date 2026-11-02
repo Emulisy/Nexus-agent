@@ -6,7 +6,7 @@ package memory
 import (
 	"strings"
 
-	"github.com/chengpeng-cp/nexus-agent/internal/llm"
+	"github.com/Emulisy/SupaAgent/internal/llm"
 )
 
 // ShortTermConfig selects a message window and an approximate token allowance.

@@ -6,8 +6,8 @@ package api
 import (
 	"net/http"
 
-	"github.com/chengpeng-cp/nexus-agent/internal/model"
-	"github.com/chengpeng-cp/nexus-agent/internal/service"
+	"github.com/Emulisy/SupaAgent/internal/model"
+	"github.com/Emulisy/SupaAgent/internal/service"
 )
 
 // ListWorkflows returns definitions created by the authenticated user.

@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/chengpeng-cp/nexus-agent/internal/config"
-	"github.com/chengpeng-cp/nexus-agent/internal/pkg/errcode"
+	"github.com/Emulisy/SupaAgent/internal/config"
+	"github.com/Emulisy/SupaAgent/internal/pkg/errcode"
 )
 
 // Gateway manages provider adapters and provider-local resilience controls.

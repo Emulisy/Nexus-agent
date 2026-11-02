@@ -9,7 +9,7 @@ import (
 
 	"gorm.io/gorm"
 
-	"github.com/chengpeng-cp/nexus-agent/internal/model"
+	"github.com/Emulisy/SupaAgent/internal/model"
 )
 
 // AgentRepo persists agent configuration and enforces owner predicates in scoped methods.

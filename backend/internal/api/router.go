@@ -4,7 +4,7 @@ package api
 import (
 	"net/http"
 
-	"github.com/chengpeng-cp/nexus-agent/internal/security"
+	"github.com/Emulisy/SupaAgent/internal/security"
 )
 
 func NewRouter(h *Handler, jwt *security.JWTManager) http.Handler {

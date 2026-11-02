@@ -10,8 +10,8 @@ import (
 	"os"
 	"strings"
 
-	"github.com/chengpeng-cp/nexus-agent/internal/model"
-	"github.com/chengpeng-cp/nexus-agent/internal/repo"
+	"github.com/Emulisy/SupaAgent/internal/model"
+	"github.com/Emulisy/SupaAgent/internal/repo"
 )
 
 // providerPreset holds the initial provider identity, endpoint, chat model, alias, and selection metadata.

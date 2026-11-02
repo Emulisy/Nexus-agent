@@ -8,7 +8,7 @@ import (
 
 	"gorm.io/gorm"
 
-	"github.com/chengpeng-cp/nexus-agent/internal/model"
+	"github.com/Emulisy/SupaAgent/internal/model"
 )
 
 // LLMRepo reads and writes model providers/configurations using either the shared DB or a transaction handle.

@@ -17,8 +17,8 @@ import (
 	_ "github.com/golang-migrate/migrate/v4/source/file"
 	"golang.org/x/crypto/bcrypt"
 
-	"github.com/chengpeng-cp/nexus-agent/internal/config"
-	"github.com/chengpeng-cp/nexus-agent/internal/infra"
+	"github.com/Emulisy/SupaAgent/internal/config"
+	"github.com/Emulisy/SupaAgent/internal/infra"
 )
 
 // main parses the rollback count and reports migration failures with a nonzero exit status.

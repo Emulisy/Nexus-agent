@@ -8,7 +8,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
-	"github.com/chengpeng-cp/nexus-agent/internal/config"
+	"github.com/Emulisy/SupaAgent/internal/config"
 )
 
 // NewRedis builds a client for the selected address, credentials, and logical DB.

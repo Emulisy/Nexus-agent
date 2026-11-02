@@ -12,8 +12,8 @@ import (
 
 	"gorm.io/gorm"
 
-	"github.com/chengpeng-cp/nexus-agent/internal/model"
-	"github.com/chengpeng-cp/nexus-agent/internal/rag/engine"
+	"github.com/Emulisy/SupaAgent/internal/model"
+	"github.com/Emulisy/SupaAgent/internal/rag/engine"
 )
 
 // KBRepo implements both management persistence and the retrieval engine's chunk repository.

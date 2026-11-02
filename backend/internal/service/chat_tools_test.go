@@ -12,13 +12,13 @@ import (
 
 	"gorm.io/datatypes"
 
-	"github.com/chengpeng-cp/nexus-agent/internal/agent"
-	"github.com/chengpeng-cp/nexus-agent/internal/agent/host"
-	"github.com/chengpeng-cp/nexus-agent/internal/agent/runtime"
-	"github.com/chengpeng-cp/nexus-agent/internal/config"
-	"github.com/chengpeng-cp/nexus-agent/internal/llm"
-	"github.com/chengpeng-cp/nexus-agent/internal/model"
-	"github.com/chengpeng-cp/nexus-agent/internal/tool"
+	"github.com/Emulisy/SupaAgent/internal/agent"
+	"github.com/Emulisy/SupaAgent/internal/agent/host"
+	"github.com/Emulisy/SupaAgent/internal/agent/runtime"
+	"github.com/Emulisy/SupaAgent/internal/config"
+	"github.com/Emulisy/SupaAgent/internal/llm"
+	"github.com/Emulisy/SupaAgent/internal/model"
+	"github.com/Emulisy/SupaAgent/internal/tool"
 )
 
 type calculatorCatalog struct{}

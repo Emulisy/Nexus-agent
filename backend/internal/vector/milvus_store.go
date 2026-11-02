@@ -9,7 +9,7 @@ import (
 	"github.com/milvus-io/milvus-sdk-go/v2/client"
 	"github.com/milvus-io/milvus-sdk-go/v2/entity"
 
-	"github.com/chengpeng-cp/nexus-agent/internal/infra"
+	"github.com/Emulisy/SupaAgent/internal/infra"
 )
 
 // MilvusStore adapts one reusable SDK client to Store operations.

@@ -1,4 +1,4 @@
-module github.com/chengpeng-cp/nexus-agent
+module github.com/Emulisy/SupaAgent
 
 go 1.26.0
 

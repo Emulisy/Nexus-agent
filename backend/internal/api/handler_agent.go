@@ -6,7 +6,7 @@ package api
 import (
 	"net/http"
 
-	"github.com/chengpeng-cp/nexus-agent/internal/model"
+	"github.com/Emulisy/SupaAgent/internal/model"
 )
 
 // ListAgents returns shared agents and agents owned by the caller, with pagination.

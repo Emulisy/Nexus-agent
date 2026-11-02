@@ -9,14 +9,14 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
-	"github.com/chengpeng-cp/nexus-agent/internal/config"
-	"github.com/chengpeng-cp/nexus-agent/internal/llm"
-	"github.com/chengpeng-cp/nexus-agent/internal/pkg/errcode"
-	"github.com/chengpeng-cp/nexus-agent/internal/rag/engine"
-	"github.com/chengpeng-cp/nexus-agent/internal/repo"
-	"github.com/chengpeng-cp/nexus-agent/internal/security"
-	"github.com/chengpeng-cp/nexus-agent/internal/tool"
-	"github.com/chengpeng-cp/nexus-agent/internal/vector"
+	"github.com/Emulisy/SupaAgent/internal/config"
+	"github.com/Emulisy/SupaAgent/internal/llm"
+	"github.com/Emulisy/SupaAgent/internal/pkg/errcode"
+	"github.com/Emulisy/SupaAgent/internal/rag/engine"
+	"github.com/Emulisy/SupaAgent/internal/repo"
+	"github.com/Emulisy/SupaAgent/internal/security"
+	"github.com/Emulisy/SupaAgent/internal/tool"
+	"github.com/Emulisy/SupaAgent/internal/vector"
 )
 
 // Deps contains resources created by the process entry point.

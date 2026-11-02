@@ -19,11 +19,11 @@ import (
 	"github.com/minio/minio-go/v7"
 	"github.com/redis/go-redis/v9"
 
-	"github.com/chengpeng-cp/nexus-agent/internal/config"
-	"github.com/chengpeng-cp/nexus-agent/internal/model"
-	"github.com/chengpeng-cp/nexus-agent/internal/rag/engine"
-	"github.com/chengpeng-cp/nexus-agent/internal/rag/loader"
-	"github.com/chengpeng-cp/nexus-agent/internal/repo"
+	"github.com/Emulisy/SupaAgent/internal/config"
+	"github.com/Emulisy/SupaAgent/internal/model"
+	"github.com/Emulisy/SupaAgent/internal/rag/engine"
+	"github.com/Emulisy/SupaAgent/internal/rag/loader"
+	"github.com/Emulisy/SupaAgent/internal/repo"
 )
 
 const (

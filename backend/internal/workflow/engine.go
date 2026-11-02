@@ -11,11 +11,11 @@ import (
 
 	"github.com/expr-lang/expr"
 
-	"github.com/chengpeng-cp/nexus-agent/internal/llm"
-	"github.com/chengpeng-cp/nexus-agent/internal/model"
-	"github.com/chengpeng-cp/nexus-agent/internal/pkg/errcode"
-	"github.com/chengpeng-cp/nexus-agent/internal/rag/engine"
-	"github.com/chengpeng-cp/nexus-agent/internal/tool"
+	"github.com/Emulisy/SupaAgent/internal/llm"
+	"github.com/Emulisy/SupaAgent/internal/model"
+	"github.com/Emulisy/SupaAgent/internal/pkg/errcode"
+	"github.com/Emulisy/SupaAgent/internal/rag/engine"
+	"github.com/Emulisy/SupaAgent/internal/tool"
 )
 
 // SubRunner executes a referenced workflow through service wiring, keeping the

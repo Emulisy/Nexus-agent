@@ -10,10 +10,10 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/chengpeng-cp/nexus-agent/internal/agent"
-	"github.com/chengpeng-cp/nexus-agent/internal/agent/runtime"
-	"github.com/chengpeng-cp/nexus-agent/internal/llm"
-	"github.com/chengpeng-cp/nexus-agent/internal/pkg/errcode"
+	"github.com/Emulisy/SupaAgent/internal/agent"
+	"github.com/Emulisy/SupaAgent/internal/agent/runtime"
+	"github.com/Emulisy/SupaAgent/internal/llm"
+	"github.com/Emulisy/SupaAgent/internal/pkg/errcode"
 )
 
 // Expert is a service-resolved specialist configuration. Runner receives a copy

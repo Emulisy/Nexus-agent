@@ -13,12 +13,12 @@ import (
 
 	"gorm.io/datatypes"
 
-	"github.com/chengpeng-cp/nexus-agent/internal/config"
-	"github.com/chengpeng-cp/nexus-agent/internal/llm"
-	"github.com/chengpeng-cp/nexus-agent/internal/model"
-	"github.com/chengpeng-cp/nexus-agent/internal/rag/loader"
-	"github.com/chengpeng-cp/nexus-agent/internal/rag/splitter"
-	"github.com/chengpeng-cp/nexus-agent/internal/vector"
+	"github.com/Emulisy/SupaAgent/internal/config"
+	"github.com/Emulisy/SupaAgent/internal/llm"
+	"github.com/Emulisy/SupaAgent/internal/model"
+	"github.com/Emulisy/SupaAgent/internal/rag/loader"
+	"github.com/Emulisy/SupaAgent/internal/rag/splitter"
+	"github.com/Emulisy/SupaAgent/internal/vector"
 )
 
 // ChunkRepo supplies chunk persistence and keyword ranking without exposing the

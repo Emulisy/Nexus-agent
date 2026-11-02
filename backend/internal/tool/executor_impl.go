@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/chengpeng-cp/nexus-agent/internal/llm"
-	"github.com/chengpeng-cp/nexus-agent/internal/model"
-	"github.com/chengpeng-cp/nexus-agent/internal/pkg/errcode"
+	"github.com/Emulisy/SupaAgent/internal/llm"
+	"github.com/Emulisy/SupaAgent/internal/model"
+	"github.com/Emulisy/SupaAgent/internal/pkg/errcode"
 )
 
 // ToolRepo resolves stored descriptions, parameter schemas, and per-tool timeout

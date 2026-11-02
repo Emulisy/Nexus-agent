@@ -9,7 +9,7 @@ import (
 
 	"gorm.io/gorm"
 
-	"github.com/chengpeng-cp/nexus-agent/internal/model"
+	"github.com/Emulisy/SupaAgent/internal/model"
 )
 
 // ErrUserAlreadyExists identifies a duplicate username/email detected inside the registration transaction.

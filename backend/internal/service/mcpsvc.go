@@ -10,10 +10,10 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/chengpeng-cp/nexus-agent/internal/mcp"
-	"github.com/chengpeng-cp/nexus-agent/internal/model"
-	"github.com/chengpeng-cp/nexus-agent/internal/pkg/errcode"
-	"github.com/chengpeng-cp/nexus-agent/internal/tool"
+	"github.com/Emulisy/SupaAgent/internal/mcp"
+	"github.com/Emulisy/SupaAgent/internal/model"
+	"github.com/Emulisy/SupaAgent/internal/pkg/errcode"
+	"github.com/Emulisy/SupaAgent/internal/tool"
 )
 
 // MCPService shares server persistence and optionally registers remote-call handlers in a tool registry.

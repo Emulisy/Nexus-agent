@@ -6,10 +6,10 @@ package service
 import (
 	"context"
 
-	"github.com/chengpeng-cp/nexus-agent/internal/memory/long_term"
-	"github.com/chengpeng-cp/nexus-agent/internal/model"
-	"github.com/chengpeng-cp/nexus-agent/internal/pkg/errcode"
-	"github.com/chengpeng-cp/nexus-agent/internal/pkg/pagination"
+	"github.com/Emulisy/SupaAgent/internal/memory/long_term"
+	"github.com/Emulisy/SupaAgent/internal/model"
+	"github.com/Emulisy/SupaAgent/internal/pkg/errcode"
+	"github.com/Emulisy/SupaAgent/internal/pkg/pagination"
 )
 
 // memoryCollection must match the vector collection used by long_term.Manager.

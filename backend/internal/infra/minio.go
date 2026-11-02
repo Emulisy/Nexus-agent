@@ -8,7 +8,7 @@ import (
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 
-	"github.com/chengpeng-cp/nexus-agent/internal/config"
+	"github.com/Emulisy/SupaAgent/internal/config"
 )
 
 // NewMinIO configures static S3 credentials and TLS from application settings.

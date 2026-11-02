@@ -7,8 +7,8 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/chengpeng-cp/nexus-agent/internal/logging"
-	"github.com/chengpeng-cp/nexus-agent/internal/security"
+	"github.com/Emulisy/SupaAgent/internal/logging"
+	"github.com/Emulisy/SupaAgent/internal/security"
 )
 
 type contextKey struct{}

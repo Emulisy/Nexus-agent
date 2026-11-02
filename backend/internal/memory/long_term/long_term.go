@@ -11,9 +11,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/chengpeng-cp/nexus-agent/internal/llm"
-	"github.com/chengpeng-cp/nexus-agent/internal/model"
-	"github.com/chengpeng-cp/nexus-agent/internal/vector"
+	"github.com/Emulisy/SupaAgent/internal/llm"
+	"github.com/Emulisy/SupaAgent/internal/model"
+	"github.com/Emulisy/SupaAgent/internal/vector"
 )
 
 // MemoryRepo supplies durable facts and scope filtering without exposing a

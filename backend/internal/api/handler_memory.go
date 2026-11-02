@@ -6,7 +6,7 @@ package api
 import (
 	"net/http"
 
-	"github.com/chengpeng-cp/nexus-agent/internal/service"
+	"github.com/Emulisy/SupaAgent/internal/service"
 )
 
 // ListMemories returns the caller's memory records, including archived records.

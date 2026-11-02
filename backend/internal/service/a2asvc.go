@@ -10,10 +10,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/chengpeng-cp/nexus-agent/internal/a2a"
-	"github.com/chengpeng-cp/nexus-agent/internal/agent"
-	"github.com/chengpeng-cp/nexus-agent/internal/model"
-	"github.com/chengpeng-cp/nexus-agent/internal/pkg/errcode"
+	"github.com/Emulisy/SupaAgent/internal/a2a"
+	"github.com/Emulisy/SupaAgent/internal/agent"
+	"github.com/Emulisy/SupaAgent/internal/model"
+	"github.com/Emulisy/SupaAgent/internal/pkg/errcode"
 )
 
 // A2AService combines the remote registry with a reusable A2A HTTP client.

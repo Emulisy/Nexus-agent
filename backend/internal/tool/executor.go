@@ -7,7 +7,7 @@ package tool
 import (
 	"context"
 
-	"github.com/chengpeng-cp/nexus-agent/internal/llm"
+	"github.com/Emulisy/SupaAgent/internal/llm"
 )
 
 // Executor exposes tool definitions to a runner and converts handler results to

@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/chengpeng-cp/nexus-agent/internal/pkg/errcode"
+	"github.com/Emulisy/SupaAgent/internal/pkg/errcode"
 )
 
 // Client owns a reusable HTTP transport with a two-minute request timeout.
