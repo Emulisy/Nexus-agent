@@ -1,10 +1,13 @@
 /**
- * 对话域类型 —— 对应 model/auth.go(Session/Message)、agent/event.go(SSE)、
- * rag/engine Ref、runtime/planner Plan。
+ * Conversation records and the SSE payloads consumed by the chat store.
+ * Persisted messages carry server IDs, usage, references, and optional trace
+ * metadata. Streaming payloads are assembled independently, then replaced by
+ * server history after completion, failure, or cancellation.
  */
-import type { PageQuery } from './api';
-
-/** 会话（ID 为 UUID，防遍历） */
+/**
+ * Session summary. IDs are server-issued UUIDs, and optional agent_id describes
+ * the stored association rather than the current frontend selector value.
+ */
 export interface Session {
   id: string;
   user_id: number;
@@ -15,21 +18,22 @@ export interface Session {
   message_count: number;
   token_usage: number;
   last_msg_at?: string | null;
+  /** Additional message metadata; agent_trace supplies the persisted decision timeline. */
   metadata?: Record<string, unknown>;
   created_at: string;
   updated_at: string;
 }
 
-/** 消息角色 */
+/** Roles stored in conversation history and used when constructing model context. */
 export type MessageRole = 'user' | 'assistant' | 'system' | 'tool';
 
 /**
- * 决策链步骤 —— messages[].metadata.agent_trace 数组元素，
- * 字段与 observability.AgentTraceCollector 完全对应。
+ * Persisted messages[].metadata.agent_trace entry, matching the backend trace collector.
+ * Type/status stay open strings so unfamiliar events can still be displayed.
  */
 export interface TraceStep {
   seq: number;
-  /** plan / thought / action / observe / delegate / merge / answer */
+  /** Trace category, for example thought, action, observe, delegate, merge, or answer. */
   type: string;
   agent: string;
   content: string;
@@ -37,12 +41,11 @@ export interface TraceStep {
   args?: Record<string, unknown>;
   result?: string;
   elapsed_ms: number;
-  /** ok / error / timeout */
   status?: string;
   time: string;
 }
 
-/** RAG 引用（engine.Ref） */
+/** Retrieved chunk citation with source location, excerpt, and similarity score. */
 export interface RAGRef {
   chunk_id: number;
   document_id: number;
@@ -52,7 +55,10 @@ export interface RAGRef {
   score: number;
 }
 
-/** 历史消息（GET /sessions/:id/messages 元素） */
+/**
+ * Persisted message record returned by the history endpoint. Optional reasoning,
+ * references, and trace metadata allow ordinary and tool-assisted turns to share a shape.
+ */
 export interface Message {
   id: number;
   session_id: string;
@@ -67,23 +73,16 @@ export interface Message {
   completion_tokens: number;
   first_token_ms: number;
   latency_ms: number;
-  /** 1 完成 / 2 中断 / 3 失败 */
+  /** 1 = complete, 2 = interrupted, 3 = failed. */
   status: 1 | 2 | 3;
-  trace_id: string;
-  /** 含 agent_trace: TraceStep[] 决策链 */
   metadata?: { agent_trace?: TraceStep[] } & Record<string, unknown>;
   created_at: string;
 }
 
-/** 会话列表查询 */
-export type SessionQuery = PageQuery;
-
-/* ============================================================
-   SSE 事件协议 —— 与 agent/event.go 十二种事件一一对应
-   序列：meta → (reasoning/plan/tool_call/tool_result/agent_event/refs/usage/approval)*
-       → delta* → done | error
-   ============================================================ */
-
+/**
+ * Event names understood by the chat protocol. Not every event has a visual handler:
+ * approval currently falls through the reducer, and agent_event is stored without a view.
+ */
 export type SSEEventType =
   | 'meta'
   | 'delta'
@@ -98,62 +97,47 @@ export type SSEEventType =
   | 'done'
   | 'error';
 
-/** meta：会话元信息（首个事件） */
-export interface MetaData {
-  session_id: string;
-  agent: string;
-  message_id: number;
-  /** 多智能体 host 路由时携带命中的专家 */
-  expert?: string;
-}
-
-/** delta / reasoning：增量文本 */
-export interface DeltaData {
-  content: string;
-}
-
-/** plan：Plan-and-Execute 计划 */
+/**
+ * Display payload for an incoming plan event. This type does not start a planner
+ * or imply that every backend runner emits plans.
+ */
 export interface PlanData {
   goal: string;
   steps: PlanStep[];
 }
 
+/** One displayed plan item with upstream step IDs listed as dependencies. */
 export interface PlanStep {
   id: string;
   description: string;
   depends_on: string[];
 }
 
-/** tool_call：开始调用工具 */
+/** Start of a tool call. Its ID joins the later result to the same live timeline node. */
 export interface ToolCallData {
   id: string;
   name: string;
-  args: string; // JSON 字符串
+  args: string; // JSON-encoded arguments.
 }
 
-/** tool_result：工具返回 */
+/** Completion of a tool call, including serialized output and elapsed milliseconds. */
 export interface ToolResultData {
   id: string;
   result: string;
+  /** Elapsed tool execution time in milliseconds. */
   ms: number;
-  /** ok / error / timeout */
+  /** Tool result status, normally ok, error, or timeout. */
   status: string;
 }
 
-/** agent_event：多智能体委派/进度/聚合 */
+/** Remote-agent routing/progress payload retained by the streaming state. */
 export interface AgentEventData {
-  /** delegate / progress / merge */
   type: string;
   expert: string;
   detail: string;
 }
 
-/** refs：RAG 引用 */
-export interface RefsData {
-  items: RAGRef[];
-}
-
-/** usage：Token 用量与成本 */
+/** Usage event reported by the backend for the completed turn. Cost is a decimal string. */
 export interface UsageData {
   prompt_tokens: number;
   completion_tokens: number;
@@ -161,34 +145,24 @@ export interface UsageData {
   model: string;
 }
 
-/** done：正常结束 */
-export interface DoneData {
-  finish_reason: string;
-}
-
-/** error：失败结束 */
-export interface ErrorData {
-  code: number;
-  message: string;
-}
-
-/** 对话请求体（POST /chat/stream） */
+/**
+ * One chat turn: only the new content and selection IDs are submitted.
+ * The backend loads history and constructs context from the session.
+ */
 export interface ChatReq {
   session_id?: string;
   agent_id?: number;
   content: string;
-  /** 本次发送使用的模型；0/未传 = 沿用 Agent 绑定模型 */
+  /** Zero or omission uses the agent's configured model. */
   model_config_id?: number;
 }
 
-/** 对话页模型选择器条目（GET /models） */
+/** Enabled model option returned by /models for the conversation selector. */
 export interface ChatModelItem {
   id: number;
-  /** 展示名（alias 优先） */
+  /** Display label resolved by the backend, preferring an alias when available. */
   label: string;
-  /** 上游模型名 */
   model_name: string;
-  /** 供应商展示名 */
   provider: string;
   is_default: boolean;
 }

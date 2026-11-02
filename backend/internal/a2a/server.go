@@ -1,11 +1,6 @@
-// A2A 服务端：把本平台的 Agent 暴露为 A2A 可调用节点（Ep 14 演示）。
-//
-// 端点：
-//   GET  /.well-known/agent.json   名片自描述
-//   POST /a2a                      JSON-RPC（message/send）
-//
-// 设计：server 包不含 Agent 执行逻辑，通过 Handler 回调注入（service 层装配），
-// 保持协议层与业务层解耦。
+// Inbound A2A adaptation delegates text execution to an injected application callback.
+// The protocol layer owns discovery and result envelopes; it does not own chat
+// persistence, model selection, authentication policy, or background task storage.
 package a2a
 
 import (
@@ -17,28 +12,32 @@ import (
 	"time"
 )
 
-// AgentFunc Agent 执行回调：输入用户文本，返回回答文本。
+// AgentFunc synchronously executes the concatenated text parts for a request.
+// Its context comes from net/http and its returned error becomes a failed task result.
 type AgentFunc func(ctx context.Context, text string) (string, error)
 
-// Server A2A 服务端。
+// Server publishes one discovery card and invokes one execution callback.
+// The atomic counter distinguishes locally generated task IDs within this process.
 type Server struct {
 	card     *AgentCard
 	handler  AgentFunc
 	nextTask int64
 }
 
-// NewServer 构造。
+// NewServer binds discovery metadata and execution without starting a listener.
 func NewServer(card *AgentCard, handler AgentFunc) *Server {
 	return &Server{card: card, handler: handler}
 }
 
-// CardHandler GET /.well-known/agent.json
+// CardHandler serializes the configured discovery card as JSON.
 func (s *Server) CardHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(s.card)
 }
 
-// RPCHandler POST /a2a —— JSON-RPC 2.0 分发。
+// RPCHandler accepts POSTed message/send and message/ping calls.
+// It concatenates text parts, waits for the application callback, and emits a
+// completed or failed task. Unsupported methods and invalid payloads use RPC errors.
 func (s *Server) RPCHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -82,7 +81,7 @@ func (s *Server) RPCHandler(w http.ResponseWriter, r *http.Request) {
 			ID:    s.newTaskID(),
 			State: StateCompleted,
 			Messages: []Message{{
-				Role: RoleAgent,
+				Role:  RoleAgent,
 				Parts: []Part{{Type: "text", Text: answer}},
 			}},
 			Artifacts: []Artifact{{
@@ -100,12 +99,14 @@ func (s *Server) RPCHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// newTaskID combines a timestamp and atomic process-local sequence number.
 func (s *Server) newTaskID() string {
 	n := atomic.AddInt64(&s.nextTask, 1)
 	return fmt.Sprintf("task-%d-%d", time.Now().UnixMilli(), n)
 }
 
-// writeRPCResult 成功响应。
+// writeRPCResult preserves the request ID and task result. A callback failure
+// can add an error member alongside the failed-task result in this implementation.
 func writeRPCResult(w http.ResponseWriter, id json.RawMessage, result any, errMsg string) {
 	resp := map[string]any{
 		"jsonrpc": "2.0",
@@ -119,7 +120,8 @@ func writeRPCResult(w http.ResponseWriter, id json.RawMessage, result any, errMs
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
-// writeRPCError 错误响应。
+// writeRPCError encodes a protocol-level failure with the original request ID
+// when available; parse failures pass a null ID.
 func writeRPCError(w http.ResponseWriter, id json.RawMessage, code int, msg string) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
@@ -129,7 +131,8 @@ func writeRPCError(w http.ResponseWriter, id json.RawMessage, code int, msg stri
 	})
 }
 
-// RegisterRoutes 把 A2A 端点挂到标准 http mux（主服务复用同一 mux 或独立端口均可）。
+// RegisterRoutes attaches discovery and /a2a handlers to the supplied mux.
+// The caller owns listener startup, exposure, and shutdown.
 func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/.well-known/agent.json", s.CardHandler)
 	mux.HandleFunc("/a2a", s.RPCHandler)

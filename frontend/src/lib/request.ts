@@ -1,25 +1,19 @@
 /**
- * HTTP 请求层 —— 基于 fetch 的统一封装。
- *
- * 职责：
- * 1. 拼统一响应包络（Envelope），code != 0 抛 ApiError；
- * 2. 自动携带 Authorization: Bearer <accessToken>；
- * 3. 401 时静默调 /auth/refresh 换新并重放原请求（单飞，防并发刷新风暴）；
- * 4. 刷新失败 → 清登录态并跳登录页。
- *
- * 与 ep17 后端语义对齐：access 放内存，refresh 放 localStorage。
+ * Shared JSON request client for the /api/v1 response envelope.
+ * Requests attach the in-memory access token, unwrap successful data, and turn
+ * business errors into ApiError. Concurrent 401 responses share one token refresh
+ * and retry their original requests once. Streaming chat has a separate transport
+ * in sse.ts and does not inherit this refresh-and-replay behavior.
  */
 import type { Envelope } from '@/types/api';
 
 const BASE = '/api/v1';
 
-/* ---- Token 存取：access 内存态由 auth store 持有，这里通过注入回调解耦 ---- */
-
 let getAccessToken: () => string | undefined = () => undefined;
 let onAuthExpired: () => void = () => undefined;
 let onTokenRefreshed: (token: string) => void = () => undefined;
 
-/** 由 auth store 在启动时注入，避免循环依赖 */
+/** Inject auth callbacks to avoid a dependency on the store. */
 export function bindAuthHooks(
   getter: () => string | undefined,
   expired: () => void,
@@ -30,11 +24,16 @@ export function bindAuthHooks(
   onTokenRefreshed = refreshed;
 }
 
-/* ---- 刷新单飞：并发 401 只发一次 refresh，其余排队等结果 ---- */
+/** Share one refresh request across concurrent 401 responses. */
 
 let refreshing: Promise<string | null> | null = null;
 
-/** 用 refresh_token 换新 access token；失败返回 null */
+/**
+ * Exchange the persisted refresh token without using request(), preventing a
+ * recursive 401 retry. Rotate the stored refresh token and synchronously update
+ * the auth store before releasing callers that are waiting to replay requests.
+ * Missing credentials, invalid envelopes, and transport failures resolve to null.
+ */
 async function doRefresh(): Promise<string | null> {
   const refreshToken = localStorage.getItem('nx.refresh');
   if (!refreshToken) return null;
@@ -50,7 +49,6 @@ async function doRefresh(): Promise<string | null> {
     }>;
     if (res.status !== 200 || env.code !== 0 || !env.data) return null;
     localStorage.setItem('nx.refresh', env.data.refresh_token);
-    // 同步更新 auth store 的内存 token，后续请求直接用新值
     onTokenRefreshed(env.data.access_token);
     return env.data.access_token;
   } catch {
@@ -58,7 +56,11 @@ async function doRefresh(): Promise<string | null> {
   }
 }
 
-/** 单飞入口 */
+/**
+ * Coalesce concurrent refresh attempts into one promise. All waiting requests
+ * receive the same outcome; finally clears the shared slot so a later expiry
+ * can start another exchange.
+ */
 function refreshOnce(): Promise<string | null> {
   refreshing ??= doRefresh().finally(() => {
     refreshing = null;
@@ -66,12 +68,14 @@ function refreshOnce(): Promise<string | null> {
   return refreshing;
 }
 
-/* ---- 业务错误 ---- */
-
+/**
+ * Application error with both backend code and HTTP status. Pages can display
+ * message while callers retain structured information for status-specific handling.
+ */
 export class ApiError extends Error {
-  /** 业务错误码（非 0），与后端 errcode 分段一致 */
+  /** Backend application code, distinct from the transport status. */
   readonly code: number;
-  /** HTTP 状态码 */
+  /** HTTP status retained for diagnostics and status-specific callers. */
   readonly status: number;
 
   constructor(code: number, message: string, status: number) {
@@ -82,23 +86,24 @@ export class ApiError extends Error {
   }
 }
 
-/* ---- 核心请求 ---- */
-
 interface RequestOptions {
   method?: 'GET' | 'POST' | 'PUT' | 'DELETE';
-  /** JSON 请求体（自动序列化；上传场景传 FormData） */
+  /** JSON body serialized by request(); use formData for file uploads. */
   body?: unknown;
-  /** 追加查询参数 */
+  /** Additional URL parameters; undefined and empty-string values are omitted. */
   query?: Record<string, string | number | boolean | undefined>;
-  /** 401 时是否尝试刷新重放（登录/刷新接口本身要关掉） */
+  /** Set false to skip the single refresh-and-replay attempt on HTTP 401. */
   retry401?: boolean;
-  /** 上传：跳过 Content-Type 让浏览器带 boundary */
+  /** Leave Content-Type unset so the browser supplies the multipart boundary. */
   formData?: FormData;
-  /** 中断信号（SSE 之外的普通请求一般用不到） */
+  /** Optional cancellation signal for ordinary REST requests. */
   signal?: AbortSignal;
 }
 
-/** 拼查询串：跳过 undefined */
+/**
+ * Serialize defined, nonempty query values. False and zero are retained because
+ * they can be meaningful filters; omitted/empty fields do not reach the URL.
+ */
 function buildQuery(query?: RequestOptions['query']): string {
   if (!query) return '';
   const qs = new URLSearchParams();
@@ -110,8 +115,10 @@ function buildQuery(query?: RequestOptions['query']): string {
 }
 
 /**
- * 统一请求函数。
- * @returns data 字段内容（包络已拆开）
+ * Attach authentication, serialize the request body, and unwrap the server envelope.
+ * A successful refresh replays the same options once with retry401 disabled.
+ * JSON and FormData are separate paths so multipart boundaries remain browser-owned.
+ * Network errors propagate; malformed response JSON becomes an HTTP-context ApiError.
  */
 export async function request<T>(
   path: string,
@@ -125,7 +132,7 @@ export async function request<T>(
 
   let payload: BodyInit | undefined;
   if (formData) {
-    payload = formData; // 浏览器自动设置 multipart boundary
+    payload = formData;
   } else if (body !== undefined) {
     headers['Content-Type'] = 'application/json';
     payload = JSON.stringify(body);
@@ -136,32 +143,37 @@ export async function request<T>(
     { method, headers, body: payload, signal },
   );
 
-  // 401 → 静默刷新并重放一次（仅带凭证的业务请求）
+  // Retry once after refreshing the access token.
   if (res.status === 401 && retry401) {
     const newToken = await refreshOnce();
     if (newToken) {
       return request<T>(path, { ...options, retry401: false });
     }
     onAuthExpired();
-    throw new ApiError(20101, '登录已过期', 401);
+    throw new ApiError(20101, 'Your session has expired', 401);
   }
 
-  // 后端统一返回 JSON 包络；网络层错误兜底
+  /**
+   * HTTP error responses are expected to use the same JSON envelope. A non-JSON
+   * response keeps its HTTP status in the fallback error.
+   */
   let env: Envelope<T>;
   try {
     env = (await res.json()) as Envelope<T>;
   } catch {
-    throw new ApiError(-1, `服务异常（HTTP ${res.status}）`, res.status);
+    throw new ApiError(-1, `Service error (HTTP ${res.status})`, res.status);
   }
 
   if (env.code !== 0) {
-    throw new ApiError(env.code, env.message || '请求失败', res.status);
+    throw new ApiError(env.code, env.message || 'Request failed', res.status);
   }
   return env.data as T;
 }
 
-/* ---- 语义化快捷方法 ---- */
-
+/**
+ * Verb-specific entry points used by API modules. These helpers preserve the
+ * shared authentication/envelope behavior and return the unwrapped data field.
+ */
 export const http = {
   get: <T>(path: string, query?: RequestOptions['query']) =>
     request<T>(path, { method: 'GET', query }),
@@ -174,9 +186,12 @@ export const http = {
     request<T>(path, { method: 'POST', formData }),
 };
 
-/** 从 ApiError 提取可展示文案 */
+/**
+ * Convert known request failures and ordinary Errors to display text without
+ * requiring each page to know the error representation.
+ */
 export function errMsg(e: unknown): string {
   if (e instanceof ApiError) return e.message;
   if (e instanceof Error) return e.message;
-  return '未知错误';
+  return 'Unknown error';
 }

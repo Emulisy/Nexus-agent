@@ -1,9 +1,3 @@
-// RRF（Reciprocal Rank Fusion）融合与查询预处理（Ep 07 教学点）。
-//
-// RRF 公式：score(d) = Σ 1/(k + rank_i(d))
-//
-//	k 为平滑常数（常用 60），rank_i 为文档在第 i 路检索中的名次（从 1 开始）。
-//	RRF 只看名次不看原始分数，天然规避"余弦相似度与 BM25 分数量纲不可比"的问题。
 package engine
 
 import (
@@ -11,7 +5,6 @@ import (
 	"fmt"
 	"sort"
 	"strings"
-	"time"
 	"unicode"
 
 	"gorm.io/datatypes"
@@ -20,35 +13,41 @@ import (
 	"github.com/chengpeng-cp/nexus-agent/internal/vector"
 )
 
-// FusedChunk 融合后的分块。
+// FusedChunk retains the source record and filename while replacing raw dense or
+// keyword scores with a fused rank score, or later a reranker relevance score.
 type FusedChunk struct {
 	Chunk    model.DocumentChunk
-	Filename string  // 所属文档名（引用展示）
-	Score    float32 // 融合分数 / rerank 分数
+	Filename string
+	Score    float32
 }
 
-// Fuse RRF 融合：稠密与关键词两路结果按名次加权合并。
+// Fuse combines dense and keyword rankings by chunk ID using reciprocal rank
+// fusion: each occurrence contributes 1/(k + rank), with ranks starting at one.
+// This avoids comparing cosine similarity directly with keyword scores. The
+// merged results are sorted descending and optionally truncated to topN.
 func Fuse(denseHits []vector.SearchHit, kwHits []ScoredChunk, k float64, topN int) []FusedChunk {
 	type entry struct {
 		chunk    model.DocumentChunk
 		filename string
 		score    float64
 	}
-	// 以 chunk ID 为键聚合两路名次
+
+	// Keep one entry per chunk so a candidate present in both retrieval paths
+	// receives both rank contributions instead of appearing twice.
 	byID := map[int64]*entry{}
 
-	rank := func(i int) float64 { return 1.0 / (k + float64(i+1)) } // 名次从 1 计
-	for i, h := range denseHits {
+	rank := func(i int) float64 { return 1.0 / (k + float64(i+1)) }
+	for _, h := range denseHits {
 		byID[h.ID] = &entry{chunk: chunkFromHit(h)}
-		_ = i
 	}
-	// 稠密路加分
+
 	for idx, h := range denseHits {
 		if e, ok := byID[h.ID]; ok {
 			e.score += rank(idx)
 		}
 	}
-	// 关键词路加分
+
+	// Keyword records can supply filenames that are absent from dense ID hits.
 	for i, h := range kwHits {
 		if e, ok := byID[h.Chunk.ID]; ok {
 			e.filename = h.Filename
@@ -69,7 +68,9 @@ func Fuse(denseHits []vector.SearchHit, kwHits []ScoredChunk, k float64, topN in
 	return out
 }
 
-// chunkFromHit 从向量检索命中还原分块（content 存在 Milvus 元数据列）。
+// chunkFromHit restores any metadata available on a vector hit. The current
+// Milvus search path supplies only the ID, so Retrieve later hydrates missing text
+// and citation fields from PostgreSQL.
 func chunkFromHit(h vector.SearchHit) model.DocumentChunk {
 	c := model.DocumentChunk{ID: h.ID}
 	if h.Metadata != nil {
@@ -89,7 +90,8 @@ func chunkFromHit(h vector.SearchHit) model.DocumentChunk {
 	return c
 }
 
-// chunkPage 从分块 Meta JSON 中取页码（无则 0）。
+// chunkPage reads the page number from chunk metadata and returns zero when it
+// is absent or malformed.
 func chunkPage(c model.DocumentChunk) int {
 	var m struct {
 		Page int `json:"page"`
@@ -100,10 +102,9 @@ func chunkPage(c model.DocumentChunk) int {
 	return m.Page
 }
 
-// extractTerms 查询分词（教学简化版）：
-//   - ASCII 连续段 → 英文词（小写化）；
-//   - 连续 CJK 段按 2-gram 切分（中文无天然分隔，bigram 是最朴素可用的方案，
-//     生产可换 jieba 等分词器 —— 见 td.md §13 演进路线）。
+// extractTerms lowercases text, keeps contiguous ASCII-range letters/digits as
+// words, and emits overlapping bigrams for contiguous CJK-range characters.
+// Duplicate terms are removed in first-seen order to avoid repeated score weight.
 func extractTerms(query string) []string {
 	query = strings.ToLower(query)
 	var terms []string
@@ -116,6 +117,8 @@ func extractTerms(query string) []string {
 			word.Reset()
 		}
 	}
+	// Single characters remain searchable; longer runs use adjacent pairs so
+	// Chinese queries do not depend on whitespace word boundaries.
 	flushCJK := func() {
 		s := cjk.String()
 		cjk.Reset()
@@ -134,10 +137,10 @@ func extractTerms(query string) []string {
 		case unicode.IsLetter(ch) && ch < 0x2E80 || unicode.IsDigit(ch):
 			flushCJK()
 			word.WriteRune(ch)
-		case ch > 0x2E80: // CJK
+		case ch > 0x2E80:
 			flushWord()
 			cjk.WriteRune(ch)
-		default: // 空格/标点
+		default:
 			flushWord()
 			flushCJK()
 		}
@@ -145,7 +148,7 @@ func extractTerms(query string) []string {
 	flushWord()
 	flushCJK()
 
-	// 去重（保持顺序）
+	// Preserve term order while deduplicating without a second output allocation.
 	seen := map[string]bool{}
 	uniq := terms[:0]
 	for _, t := range terms {
@@ -155,14 +158,4 @@ func extractTerms(query string) []string {
 		}
 	}
 	return uniq
-}
-
-// ---- 计时辅助（避免 engine.go 直接依赖 time 泛滥）----
-
-type observabilityTimer time.Time
-
-func nowTimer() observabilityTimer { return observabilityTimer(time.Now()) }
-
-func elapsedSeconds(t observabilityTimer) float64 {
-	return time.Since(time.Time(t)).Seconds()
 }

@@ -1,0 +1,8 @@
+# Inherit upstream engine and server defaults rather than maintaining a duplicate
+# full configuration. Compose supplies the server secret through SEARXNG_SECRET.
+use_default_settings: true
+
+search:
+  # web_search requests format=json. Keep HTML available for inspecting the same
+  # local instance in a browser; omitting JSON would reject the tool's requests.
+  formats: [html, json]

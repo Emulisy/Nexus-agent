@@ -1,93 +1,99 @@
-// Agent 与工具接口。
+// Agent endpoints pass authenticated ownership context to AgentService.
+// Path IDs take precedence over body IDs for updates. Tool listing reads the
+// catalog used when configuring agent bindings.
 package api
 
 import (
-	"context"
-
-	"github.com/cloudwego/hertz/pkg/app"
+	"net/http"
 
 	"github.com/chengpeng-cp/nexus-agent/internal/model"
 )
 
-// ListAgents GET /api/v1/agents
-func (h *Handler) ListAgents(ctx context.Context, c *app.RequestContext) {
-	list, total, err := h.svcs.Agent.List(ctx, userID(c), parsePagination(c))
+// ListAgents returns shared agents and agents owned by the caller, with pagination.
+func (h *Handler) ListAgents(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	list, total, err := h.svcs.Agent.List(ctx, userID(r), parsePagination(r))
 	if err != nil {
-		Fail(c, err)
+		Fail(w, err)
 		return
 	}
-	OK(c, map[string]any{"list": list, "total": total})
+	OK(w, map[string]any{"list": list, "total": total})
 }
 
-// GetAgent GET /api/v1/agents/:id
-func (h *Handler) GetAgent(ctx context.Context, c *app.RequestContext) {
-	id, err := pathID(c)
+// GetAgent returns an accessible agent or the service's not-found error.
+func (h *Handler) GetAgent(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	id, err := pathID(r)
 	if err != nil {
-		Fail(c, err)
+		Fail(w, err)
 		return
 	}
-	ag, err := h.svcs.Agent.Get(ctx, userID(c), id)
+	ag, err := h.svcs.Agent.Get(ctx, userID(r), id)
 	if err != nil {
-		Fail(c, err)
+		Fail(w, err)
 		return
 	}
-	OK(c, ag)
+	OK(w, ag)
 }
 
-// CreateAgent POST /api/v1/agents
-func (h *Handler) CreateAgent(ctx context.Context, c *app.RequestContext) {
+// CreateAgent binds an agent definition; the service assigns its owner and resolves defaults.
+func (h *Handler) CreateAgent(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
 	ag := &model.Agent{}
-	if err := c.BindAndValidate(ag); err != nil {
-		Fail(c, err)
+	if err := decodeJSON(w, r, ag); err != nil {
+		Fail(w, err)
 		return
 	}
-	if err := h.svcs.Agent.Create(ctx, userID(c), ag); err != nil {
-		Fail(c, err)
+	if err := h.svcs.Agent.Create(ctx, userID(r), ag); err != nil {
+		Fail(w, err)
 		return
 	}
-	OK(c, ag)
+	OK(w, ag)
 }
 
-// UpdateAgent PUT /api/v1/agents/:id
-func (h *Handler) UpdateAgent(ctx context.Context, c *app.RequestContext) {
-	id, err := pathID(c)
+// UpdateAgent uses the route ID and delegates editable-field merging and ownership checks.
+func (h *Handler) UpdateAgent(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	id, err := pathID(r)
 	if err != nil {
-		Fail(c, err)
+		Fail(w, err)
 		return
 	}
 	ag := &model.Agent{}
-	if err := c.BindAndValidate(ag); err != nil {
-		Fail(c, err)
+	if err := decodeJSON(w, r, ag); err != nil {
+		Fail(w, err)
 		return
 	}
 	ag.ID = id
-	if err := h.svcs.Agent.Update(ctx, userID(c), ag); err != nil {
-		Fail(c, err)
+	if err := h.svcs.Agent.Update(ctx, userID(r), ag); err != nil {
+		Fail(w, err)
 		return
 	}
-	OK(c, ag)
+	OK(w, ag)
 }
 
-// DeleteAgent DELETE /api/v1/agents/:id
-func (h *Handler) DeleteAgent(ctx context.Context, c *app.RequestContext) {
-	id, err := pathID(c)
+// DeleteAgent requests an owner-filtered deletion and returns an empty success result.
+func (h *Handler) DeleteAgent(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	id, err := pathID(r)
 	if err != nil {
-		Fail(c, err)
+		Fail(w, err)
 		return
 	}
-	if err := h.svcs.Agent.Delete(ctx, userID(c), id); err != nil {
-		Fail(c, err)
+	if err := h.svcs.Agent.Delete(ctx, userID(r), id); err != nil {
+		Fail(w, err)
 		return
 	}
-	OK(c, nil)
+	OK(w, nil)
 }
 
-// ListTools GET /api/v1/tools —— 工具清单（绑定 Agent 用）。
-func (h *Handler) ListTools(ctx context.Context, c *app.RequestContext) {
-	list, total, err := h.svcs.Repos.Tool.List(ctx, string(c.Query("type")), parsePagination(c).Offset(), parsePagination(c).Limit())
+// ListTools lists catalog records, optionally filtered by type, for agent configuration.
+func (h *Handler) ListTools(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	list, total, err := h.svcs.Repos.Tool.List(ctx, string(r.URL.Query().Get("type")), parsePagination(r).Offset(), parsePagination(r).Limit())
 	if err != nil {
-		Fail(c, err)
+		Fail(w, err)
 		return
 	}
-	OK(c, map[string]any{"list": list, "total": total})
+	OK(w, map[string]any{"list": list, "total": total})
 }

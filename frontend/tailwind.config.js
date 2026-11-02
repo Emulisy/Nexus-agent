@@ -1,48 +1,54 @@
 /**
- * Tailwind 设计系统 —— NexusAgent 暗色控制台。
- *
- * 与讲解页（docs/teach-pdf）同一设计语言：
- * 底色四级黑 + 酸性荧光绿主色，低饱和灰阶做层级。
+ * Shared Tailwind theme tokens for the workspace, management pages, and chat.
+ * Semantic token names are retained across components, so changing a token updates
+ * the same surfaces consistently. Source scanning covers the HTML entry and all
+ * TypeScript/TSX component files.
  */
 export default {
   content: ['./index.html', './src/**/*.{ts,tsx}'],
   theme: {
     extend: {
+      /** Semantic color names are consumed by shared classes and feature pages. */
       colors: {
-        /* ---- 底色四级黑（由深到浅） ---- */
-        void: '#08090a', // 页面最底
-        carbon: '#0f1011', // 面板
-        obsidian: '#161718', // 卡片
-        graphite: '#23252a', // 悬浮/输入框
-        /* ---- 灰阶（由深到浅） ---- */
-        smoke: '#383b3f', // 分隔线
-        ash: '#62666d', // 最弱文字
-        fog: '#8a8f98', // 次要文字
-        mist: '#d0d6e0', // 正文
-        bone: '#e5e5e6', // 标题
+        void: '#edf3fb',
+        carbon: '#ffffff',
+        obsidian: '#ffffff',
+        graphite: '#f0f5fc',
+        smoke: '#dbe5f2',
+        ash: '#66768d',
+        fog: '#586c89',
+        mist: '#354968',
+        bone: '#152b4b',
         paper: '#ffffff',
-        /* ---- 功能色 ---- */
-        lime: '#e4f222', // 主色：品牌荧光绿
-        teal: '#02b8cc', // 回顾/信息
-        coral: '#eb5757', // 错误/危险
-        pulse: '#27a644', // 成功
-        violet: '#6366f1', // 多智能体/特殊
+        lime: '#2764e7',
+        teal: '#367b9f',
+        coral: '#cc4558',
+        pulse: '#347b9c',
+        violet: '#6377b0',
       },
+      /** Locally hosted Latin fonts fall back to platform fonts for other scripts. */
       fontFamily: {
         sans: [
-          'Inter',
+          'Space Grotesk',
+          '-apple-system',
+          'BlinkMacSystemFont',
+          'Segoe UI',
           'PingFang SC',
           'Hiragino Sans GB',
           'Microsoft YaHei',
-          '-apple-system',
           'sans-serif',
         ],
         mono: ['JetBrains Mono', 'Menlo', 'Consolas', 'monospace'],
       },
-      /* 动效曲线：快进缓出，交互丝滑的底味 */
+      boxShadow: {
+        panel: '0 8px 30px -18px rgba(35, 68, 119, 0.18), inset 0 1px 0 rgba(255, 255, 255, 0.95)',
+        float: '0 24px 64px -28px rgba(35, 68, 119, 0.25), inset 0 1px 0 rgba(255, 255, 255, 0.9)',
+      },
+      /** Shared easing matches the short entry transitions used by UI controls. */
       transitionTimingFunction: {
         'out-expo': 'cubic-bezier(0.16, 1, 0.3, 1)',
       },
+      /** Blinking caret is attached only to live assistant content. */
       keyframes: {
         'blink-caret': {
           '0%, 100%': { opacity: '1' },

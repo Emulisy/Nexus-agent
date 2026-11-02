@@ -1,0 +1,21 @@
+/** Locally hosted fonts; licenses are included in public/fonts. */
+/**
+ * Variable Latin font assets are served locally with swap behavior; platform
+ * fonts in the theme stack cover scripts outside these files. License files
+ * are retained alongside the assets in public/fonts.
+ */
+@font-face {
+  font-family: 'Space Grotesk';
+  font-style: normal;
+  font-weight: 400 700;
+  font-display: swap;
+  src: url('/fonts/space-grotesk-latin-variable.woff2') format('woff2');
+}
+
+@font-face {
+  font-family: 'JetBrains Mono';
+  font-style: normal;
+  font-weight: 400 500;
+  font-display: swap;
+  src: url('/fonts/jetbrains-mono-latin-variable.woff2') format('woff2');
+}

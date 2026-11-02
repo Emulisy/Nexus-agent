@@ -1,4 +1,3 @@
-// 内置工具：网络搜索与 HTTP 请求。
 package tool
 
 import (
@@ -13,15 +12,19 @@ import (
 	"time"
 )
 
-// SearchConfig 搜索工具配置。
+// SearchConfig separates the search backend from direct URL fetching. HTTPClient
+// is shared by both handlers; DomainWhitelist applies only to http_client.
 type SearchConfig struct {
 	SearxngURL string
 	HTTPClient *http.Client
-	// DomainWhitelist http_client 工具的域名白名单（后缀匹配）
+
+	// DomainWhitelist permits exact hosts and subdomains. An empty list rejects
+	// all direct fetch destinations.
 	DomainWhitelist []string
 }
 
-// RegisterWeb 注册 web_search 与 http_client。
+// RegisterWeb installs web_search and http_client. When no client is injected,
+// both share a ten-second overall HTTP timeout in addition to tool cancellation.
 func RegisterWeb(r Registry, cfg SearchConfig) {
 	if cfg.HTTPClient == nil {
 		cfg.HTTPClient = &http.Client{Timeout: 10 * time.Second}
@@ -34,7 +37,9 @@ func RegisterWeb(r Registry, cfg SearchConfig) {
 	})
 }
 
-// runWebSearch 通过 SearXNG 搜索（自托管，免 API Key；可替换 Tavily 等）。
+// runWebSearch queries the configured SearXNG JSON endpoint and returns a compact
+// list of titles, URLs, and snippets. count defaults to five and accepts values
+// from one through twenty; response bytes and snippet runes are bounded.
 func runWebSearch(ctx context.Context, cfg SearchConfig, args map[string]any) (string, error) {
 	query, _ := args["query"].(string)
 	if query == "" {
@@ -46,9 +51,9 @@ func runWebSearch(ctx context.Context, cfg SearchConfig, args map[string]any) (s
 	}
 
 	params := url.Values{
-		"q":     {query},
-		"format": {"json"},
-		"language": {"zh-CN"},
+		"q":        {query},
+		"format":   {"json"},
+		"language": {"en"},
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
 		strings.TrimRight(cfg.SearxngURL, "/")+"?"+params.Encode(), nil)
@@ -77,7 +82,6 @@ func runWebSearch(ctx context.Context, cfg SearchConfig, args map[string]any) (s
 		return "", fmt.Errorf("parse search result: %v", err)
 	}
 
-	// 只保留前 N 条并结构化输出（模型可读）
 	out := make([]map[string]string, 0, count)
 	for i, r := range sr.Results {
 		if i >= count {
@@ -91,7 +95,9 @@ func runWebSearch(ctx context.Context, cfg SearchConfig, args map[string]any) (s
 	return string(b), nil
 }
 
-// runHTTPClient 白名单域名的 GET 请求。
+// runHTTPClient fetches an HTTP(S) URL after checking its initial hostname against
+// the configured whitelist. It forwards optional headers, bounds the response
+// body, removes HTML tags, and returns status plus a short plain-text excerpt.
 func runHTTPClient(ctx context.Context, cfg SearchConfig, args map[string]any) (string, error) {
 	rawURL, _ := args["url"].(string)
 	if rawURL == "" {
@@ -101,7 +107,7 @@ func runHTTPClient(ctx context.Context, cfg SearchConfig, args map[string]any) (
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
 		return "", fmt.Errorf("invalid url")
 	}
-	// 白名单校验（SSRF 防护的第一层）
+
 	if !domainAllowed(u.Hostname(), cfg.DomainWhitelist) {
 		return "", fmt.Errorf("domain %s not in whitelist", u.Hostname())
 	}
@@ -123,12 +129,12 @@ func runHTTPClient(ctx context.Context, cfg SearchConfig, args map[string]any) (
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 256*1024))
 
-	// 粗略截取正文（去 HTML 标签），教学点：给模型的应该是"内容"而不是原始 HTML
 	text := stripHTML(string(body))
 	return fmt.Sprintf(`{"status": %d, "content": %q}`, resp.StatusCode, truncateText(text, 4000)), nil
 }
 
-// domainAllowed 后缀匹配白名单。
+// domainAllowed matches a configured host or its dot-delimited subdomains. It
+// does not treat an arbitrary string suffix as a matching domain.
 func domainAllowed(host string, whitelist []string) bool {
 	for _, w := range whitelist {
 		if host == w || strings.HasSuffix(host, "."+w) {
@@ -140,14 +146,16 @@ func domainAllowed(host string, whitelist []string) bool {
 
 var htmlTagRe = regexp.MustCompile(`<[^>]+>\s*`)
 
-// stripHTML 粗提取 HTML 正文。
+// stripHTML removes tag-like markup and normalizes whitespace for model context.
+// It is text cleanup, not a full HTML parser or browser renderer.
 func stripHTML(s string) string {
 	s = htmlTagRe.ReplaceAllString(s, " ")
 	s = strings.Join(strings.Fields(s), " ")
 	return s
 }
 
-// truncateText 文本截断。
+// truncateText limits excerpts by rune count so multilingual snippets remain valid
+// UTF-8, appending an ellipsis when text is shortened.
 func truncateText(s string, max int) string {
 	r := []rune(s)
 	if len(r) <= max {

@@ -1,15 +1,21 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="en-US">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="color-scheme" content="dark" />
-    <title>NexusAgent 控制台</title>
-    <!-- 首屏防白闪：与全局 CSS 同步的底色 -->
+    <meta name="color-scheme" content="light" />
+    <meta name="theme-color" content="#edf3fb" />
+    <link rel="icon" type="image/svg+xml" href="/supa.svg" />
+    <!-- Preload local font assets to reduce the initial typography swap. -->
+    <link rel="preload" href="/fonts/space-grotesk-latin-variable.woff2" as="font" type="font/woff2" crossorigin />
+    <link rel="preload" href="/fonts/jetbrains-mono-latin-variable.woff2" as="font" type="font/woff2" crossorigin />
+    <meta name="description" content="SupaAgent brings conversations, knowledge, and workflows together in a clear, focused workspace." />
+    <title>SupaAgent · AI Workspace</title>
+    <!-- Match the application canvas before the JavaScript bundle mounts. -->
     <style>
       html,
       body {
-        background: #08090a;
+        background: #edf3fb;
       }
     </style>
   </head>

@@ -1,41 +1,34 @@
-// Provider 接口：所有模型供应商的统一抽象。
-//
-// 设计原则（td.md §8.1）：
-//   - 所有 OpenAI 兼容供应商共用 openaiCompatibleProvider，仅配置差异；
-//   - 豆包 Ark 本质也是 OpenAI 兼容（/api/v3），Ollama 提供 /v1 兼容层 ——
-//     本项目用独立类型做薄封装，教学点：新增供应商只需实现本接口。
 package llm
 
 import "context"
 
-// Provider 模型供应商接口。
+// Provider adapts the operations understood by the gateway. Implementations own
+// HTTP protocol conversion, stream channel closure, and transient-error
+// classification; the gateway owns retries, fallback, and provider-local guards.
 type Provider interface {
-	// Chat 非流式对话。
+	// Chat returns a complete response or a synchronous request error.
 	Chat(ctx context.Context, desc *ModelDescriptor, req *ChatRequest) (*ChatResponse, error)
-	// ChatStream 流式对话，返回事件通道（由实现方保证关闭）。
+
+	// ChatStream returns after the response opens. The implementation closes the
+	// returned channel after consuming the response body.
 	ChatStream(ctx context.Context, desc *ModelDescriptor, req *ChatRequest) (<-chan StreamEvent, error)
-	// Embed 文本向量化（chat 供应商可不支持，返回 ErrNotImplement）。
+
+	// Embed preserves input order in the returned vector batch.
 	Embed(ctx context.Context, desc *ModelDescriptor, texts []string) ([][]float32, error)
-	// Rerank 重排序（可选能力）。
+
+	// Rerank returns original candidate indexes with relevance scores.
 	Rerank(ctx context.Context, desc *ModelDescriptor, query string, docs []string, topN int) ([]RerankResult, error)
 }
 
-// RerankResult 重排序结果。
+// RerankResult identifies a source document by its original zero-based index.
+// Scores are provider relevance values and need not match vector similarity.
 type RerankResult struct {
-	Index int     `json:"index"` // 原文档下标
-	Score float32 `json:"score"` // 相关性分数
+	Index int     `json:"index"`
+	Score float32 `json:"score"`
 }
 
-// NewProvider 按供应商代号构造实现（注册表模式）。
-// 所有 OpenAI 兼容协议家族（deepseek/qwen/zhipu/moonshot/doubao/ollama）共用 openaiCompatibleProvider。
-func NewProvider(code string) Provider {
-	switch code {
-	case "doubao":
-		return &openaiCompatibleProvider{providerCode: "doubao"}
-	case "ollama":
-		return &openaiCompatibleProvider{providerCode: "ollama"}
-	default:
-		// openai/deepseek/qwen/zhipu/moonshot 等全部 OpenAI 兼容
-		return &openaiCompatibleProvider{providerCode: code}
-	}
+// NewProvider returns the OpenAI-compatible adapter shared by supported provider
+// codes. The descriptor supplies each actual base URL, model name, and credential.
+func NewProvider() Provider {
+	return &openaiCompatibleProvider{}
 }

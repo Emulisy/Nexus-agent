@@ -1,73 +1,53 @@
-// Package api HTTP 接口层（Hertz，td.md §7.2）。
-//
-// 职责边界：协议适配（JSON 编解码 / SSE 转写 / 参数解析 / 认证鉴权），
-// 不写业务逻辑 —— 业务在 service 层。
+// Package api adapts HTTP requests to application services using net/http.
+// JSON endpoints share a response envelope; chat writes service events as SSE.
+// Handlers bind inputs and extract identity, while services own business rules,
+// storage orchestration, and conversion to application error codes.
 package api
 
 import (
 	"errors"
+	"net/http"
+	"strconv"
 
-	"github.com/cloudwego/hertz/pkg/app"
-
+	"github.com/chengpeng-cp/nexus-agent/internal/logging"
 	"github.com/chengpeng-cp/nexus-agent/internal/pkg/errcode"
 	"github.com/chengpeng-cp/nexus-agent/internal/pkg/pagination"
 )
 
-// 统一响应包络：{code, message, data}。
-// code=0 成功；非 0 为业务错误码（见 errcode）。
+// envelope carries a stable application code alongside the HTTP status.
+// Code zero means success. Data is omitted when no result payload is present.
 type envelope struct {
 	Code    int    `json:"code"`
 	Message string `json:"message"`
 	Data    any    `json:"data,omitempty"`
 }
 
-// OK 200 成功响应。
-func OK(c *app.RequestContext, data any) {
-	c.JSON(200, envelope{Code: 0, Message: "ok", Data: data})
+// OK writes a successful HTTP 200 envelope, omitting data when it is nil.
+func OK(w http.ResponseWriter, data any) {
+	writeJSON(w, 200, envelope{Code: 0, Message: "ok", Data: data})
 }
 
-// parsePagination 分页参数解析。
-func parsePagination(c *app.RequestContext) pagination.Query {
-	return pagination.Parse(c)
+// parsePagination delegates query parsing and page limits to the pagination package.
+func parsePagination(r *http.Request) pagination.Query {
+	return pagination.Parse(r)
 }
 
-// forbidden 403 快捷响应。
-func forbidden(c *app.RequestContext) {
-	c.JSON(403, envelope{Code: 20201, Message: "无权限"})
+// forbidden writes the ownership-denial response used by session handlers.
+func forbidden(w http.ResponseWriter) {
+	writeJSON(w, 403, envelope{Code: 20201, Message: "Access denied"})
 }
 
-// Fail 错误响应：识别 errcode.Error 取状态码/业务码，未知错误按 500 处理。
-func Fail(c *app.RequestContext, err error) {
+// Fail preserves errcode.Error status and code values, including wrapped errors.
+// Unknown errors become internal failures. Underlying causes are logged but are
+// excluded from the client response so storage or provider details stay internal.
+func Fail(w http.ResponseWriter, err error) {
 	var be *errcode.Error
 	if !errors.As(err, &be) {
 		be = errcode.ErrInternal.WithCause(err)
 	}
 	if be.Cause() != nil {
-		// 内部原因只进日志，不暴露给客户端（安全基线）
-		logError("request failed", "code", itoa(be.Code), "msg", be.Message, "cause", be.Cause().Error())
+		// Keep internal error details in logs.
+		logging.LogError("request failed", "code", strconv.Itoa(be.Code), "msg", be.Message, "cause", be.Cause().Error())
 	}
-	c.JSON(be.HTTPStatus, envelope{Code: be.Code, Message: be.Message})
-}
-
-// itoa 避免在日志处 strconv 满天飞。
-func itoa(i int) string {
-	if i == 0 {
-		return "0"
-	}
-	b := [20]byte{}
-	pos := len(b)
-	neg := i < 0
-	if neg {
-		i = -i
-	}
-	for i > 0 {
-		pos--
-		b[pos] = byte('0' + i%10)
-		i /= 10
-	}
-	if neg {
-		pos--
-		b[pos] = '-'
-	}
-	return string(b[pos:])
+	writeJSON(w, be.HTTPStatus, envelope{Code: be.Code, Message: be.Message})
 }

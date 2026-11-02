@@ -1,12 +1,11 @@
-// Package service 业务编排层（td.md §7）。
-//
-// 职责：组合 repo/llm 网关/RAG 引擎/记忆/工作流等组件，实现面向用例的业务逻辑。
-// 事务边界、错误码转换、权限校验都发生在这一层；handler 只做协议适配。
+// Package service coordinates application use cases across storage and runtime components.
+// Services perform ownership checks, translate persistence errors, and compose
+// model resolution, retrieval, memory, and execution. HTTP handlers depend on
+// this layer instead of assembling those dependencies per request.
 package service
 
 import (
 	"context"
-	"errors"
 
 	"github.com/redis/go-redis/v9"
 
@@ -18,10 +17,11 @@ import (
 	"github.com/chengpeng-cp/nexus-agent/internal/security"
 	"github.com/chengpeng-cp/nexus-agent/internal/tool"
 	"github.com/chengpeng-cp/nexus-agent/internal/vector"
-	"gorm.io/gorm"
 )
 
-// Deps service 层依赖全集（main 装配）。
+// Deps contains resources created by the process entry point.
+// Optional publishers and executors may be absent in the document worker,
+// which constructs services only to reuse model resolution.
 type Deps struct {
 	Cfg       *config.Config
 	Repos     *repo.Repos
@@ -31,27 +31,25 @@ type Deps struct {
 	RDB       *redis.Client
 	Vector    vector.Store
 	Executor  tool.Executor
-	Registry  tool.Registry   // 内置工具注册表（MCP 同步工具时注册执行 handler）
-	Streams   StreamPublisher // 异步任务投递（worker 实现，可 nil）
+	Registry  tool.Registry
+	Streams   StreamPublisher
 }
 
-// StreamPublisher 异步任务投递接口（internal/worker 实现，接口在此隔离依赖方向）。
+// StreamPublisher isolates document job submission from the Redis worker package.
+// Publication is separate from the preceding database and object-store writes;
+// the interface does not provide a transaction spanning those systems.
 type StreamPublisher interface {
 	PublishDocETL(ctx context.Context, docID int64) error
-	PublishEvalRun(ctx context.Context, runID int64) error
 }
 
-// Services 业务服务集合。
+// Services shares infrastructure and exposes the application service instances.
+// Model descriptors are resolved from current persisted settings rather than
+// cached on this container. RAG/workflow engines are attached after construction
+// to break their dependency on service-provided lookup callbacks.
 type Services struct {
 	Deps
 
-	// 默认模型描述符（启动时解析一次，仅作实时解析失败时的降级兜底；
-	// 正常路径一律通过 Default*() 实时查库，保证改配置后无需重启）
-	defaultChat      *llm.ModelDescriptor
-	defaultEmbedding *llm.ModelDescriptor
-	defaultRerank    *llm.ModelDescriptor
-
-	ragEngine *engine.Engine // RAG 引擎（main 构造后注入）
+	ragEngine *engine.Engine
 
 	Auth     *AuthService
 	Models   *ModelService
@@ -64,16 +62,17 @@ type Services struct {
 	Memory   *MemoryService
 }
 
-// New 装配全部业务服务。
+// New constructs the service graph after synchronizing the startup model catalog.
+// Catalog changes run under the repository advisory lock and use encrypted provider
+// credentials. Engines and storage callbacks that depend on the services are attached
+// separately after construction; a startup synchronization failure is returned.
 func New(d Deps) (*Services, error) {
 	s := &Services{Deps: d}
 
-	// ① 默认模型解析（网关保持纯净：查库+解密在 service 完成）
-	if err := s.reloadDefaultModels(); err != nil {
+	if err := s.bootstrapDefaultModels(context.Background()); err != nil {
 		return nil, err
 	}
 
-	// ② 各业务服务
 	s.Auth = NewAuthService(d.Repos, d.JWT, d.RDB)
 	s.Models = NewModelService(d.Repos, d.Encryptor)
 	s.Chat = NewChatService(s)
@@ -86,33 +85,43 @@ func New(d Deps) (*Services, error) {
 	return s, nil
 }
 
-// DefaultChat 默认对话模型（实时查库解析；失败降级用启动缓存）。
+// DefaultChat resolves current model and provider settings on every call.
+// Disabled or invalid configurations stop being used immediately; failed resolution
+// returns nil rather than a cached startup descriptor. Callers must handle that case.
 func (s *Services) DefaultChat() *llm.ModelDescriptor {
 	if d, err := s.resolveByName(s.Deps.Cfg.LLM.DefaultChat, modelTypeChat); err == nil {
 		return d
 	}
-	return s.defaultChat
+	return nil
 }
 
-// DefaultEmbedding 默认向量化模型（实时解析，语义同 DefaultChat）。
+// DefaultEmbedding resolves the configured embedding model from the live catalog.
+// It returns nil when no eligible configuration is available, so callers cannot rely
+// on a descriptor cached before an administrator changed or disabled a provider.
 func (s *Services) DefaultEmbedding() *llm.ModelDescriptor {
 	if d, err := s.resolveByName(s.Deps.Cfg.LLM.DefaultEmbedding, modelTypeEmbed); err == nil {
 		return d
 	}
-	return s.defaultEmbedding
+	return nil
 }
 
-// DefaultRerank 默认重排序模型（未配置为 nil）。
-func (s *Services) DefaultRerank() *llm.ModelDescriptor { return s.defaultRerank }
+// DefaultRerank resolves the optional bge-reranker alias from the live catalog.
+// A missing or unavailable model returns nil, allowing retrieval to keep its fused
+// ranking instead of requiring a reranking provider.
+func (s *Services) DefaultRerank() *llm.ModelDescriptor {
+	d, _ := s.resolveByName("bge-reranker", modelTypeRerank)
+	return d
+}
 
-// ResolveModelByAlias 按别名解析模型（工作流节点用）。
-// alias 为空返回平台默认 chat 模型（实时解析，改配置即时生效）。
+// ResolveModelByAlias supplies model resolution to workflow nodes.
+// An empty alias uses DefaultChat; named aliases are resolved from current
+// configuration. This callback does not choose a separate fallback descriptor.
 func (s *Services) ResolveModelByAlias(ctx context.Context, alias string) (*llm.ModelDescriptor, *llm.ModelDescriptor, error) {
 	if alias == "" {
 		if d := s.DefaultChat(); d != nil {
 			return d, nil, nil
 		}
-		return nil, nil, errcode.ErrProviderNotFound.WithMsg("默认对话模型尚未配置")
+		return nil, nil, errcode.ErrProviderNotFound.WithMsg("No default chat model is configured")
 	}
 	m, err := s.resolveByName(alias, modelTypeChat)
 	if err != nil {
@@ -121,23 +130,5 @@ func (s *Services) ResolveModelByAlias(ctx context.Context, alias string) (*llm.
 	return m, nil, nil
 }
 
-// SetRAGEngine 注入 RAG 引擎（engine 依赖 gateway+repo，构造顺序在 service 之后）。
+// SetRAGEngine attaches retrieval after the engine has been constructed with repository dependencies.
 func (s *Services) SetRAGEngine(e *engine.Engine) { s.ragEngine = e }
-
-// reloadDefaultModels 解析平台默认模型。
-func (s *Services) reloadDefaultModels() error {
-	var err error
-	if s.defaultChat, err = s.resolveByName(s.Deps.Cfg.LLM.DefaultChat, modelTypeChat); err != nil {
-		if !errors.Is(err, gorm.ErrRecordNotFound) {
-			return err
-		}
-	}
-	if s.defaultEmbedding, err = s.resolveByName(s.Deps.Cfg.LLM.DefaultEmbedding, modelTypeEmbed); err != nil {
-		if !errors.Is(err, gorm.ErrRecordNotFound) {
-			return err
-		}
-	}
-	// rerank 可选：解析失败静默跳过（检索管线自动降级为融合排序）
-	s.defaultRerank, _ = s.resolveByName("bge-reranker", modelTypeRerank)
-	return nil
-}

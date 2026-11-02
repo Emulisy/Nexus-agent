@@ -1,60 +1,64 @@
-// 工作流接口：CRUD / 校验 / 执行 / HITL 审批。
+// Workflow endpoints expose definitions, synchronous runs, and human-step decisions.
+// The current user is supplied to ownership-aware service methods; creation
+// overrides creator_id with the authenticated account rather than trusting JSON.
 package api
 
 import (
-	"context"
-
-	"github.com/cloudwego/hertz/pkg/app"
+	"net/http"
 
 	"github.com/chengpeng-cp/nexus-agent/internal/model"
 	"github.com/chengpeng-cp/nexus-agent/internal/service"
 )
 
-// ListWorkflows GET /api/v1/workflows
-func (h *Handler) ListWorkflows(ctx context.Context, c *app.RequestContext) {
-	list, total, err := h.svcs.Workflow.List(ctx, userID(c), parsePagination(c))
+// ListWorkflows returns definitions created by the authenticated user.
+func (h *Handler) ListWorkflows(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	list, total, err := h.svcs.Workflow.List(ctx, userID(r), parsePagination(r))
 	if err != nil {
-		Fail(c, err)
+		Fail(w, err)
 		return
 	}
-	OK(c, map[string]any{"list": list, "total": total})
+	OK(w, map[string]any{"list": list, "total": total})
 }
 
-// GetWorkflow GET /api/v1/workflows/:id
-func (h *Handler) GetWorkflow(ctx context.Context, c *app.RequestContext) {
-	id, err := pathID(c)
+// GetWorkflow returns an owned definition using the route ID.
+func (h *Handler) GetWorkflow(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	id, err := pathID(r)
 	if err != nil {
-		Fail(c, err)
+		Fail(w, err)
 		return
 	}
-	w, err := h.svcs.Workflow.Get(ctx, userID(c), id)
+	workflow, err := h.svcs.Workflow.Get(ctx, userID(r), id)
 	if err != nil {
-		Fail(c, err)
+		Fail(w, err)
 		return
 	}
-	OK(c, w)
+	OK(w, workflow)
 }
 
-// CreateWorkflow POST /api/v1/workflows
-func (h *Handler) CreateWorkflow(ctx context.Context, c *app.RequestContext) {
-	w := &model.Workflow{}
-	if err := c.BindAndValidate(w); err != nil {
-		Fail(c, err)
+// CreateWorkflow stamps the current user as creator before DSL validation and insertion.
+func (h *Handler) CreateWorkflow(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	workflow := &model.Workflow{}
+	if err := decodeJSON(w, r, workflow); err != nil {
+		Fail(w, err)
 		return
 	}
-	w.CreatorID = userID(c) // creator_id 非空外键：以当前登录用户为创建者
-	if err := h.svcs.Workflow.Create(ctx, w); err != nil {
-		Fail(c, err)
+	workflow.CreatorID = userID(r)
+	if err := h.svcs.Workflow.Create(ctx, workflow); err != nil {
+		Fail(w, err)
 		return
 	}
-	OK(c, w)
+	OK(w, workflow)
 }
 
-// UpdateWorkflow PUT /api/v1/workflows/:id
-func (h *Handler) UpdateWorkflow(ctx context.Context, c *app.RequestContext) {
-	id, err := pathID(c)
+// UpdateWorkflow converts pointer-valued JSON fields into a partial service update.
+func (h *Handler) UpdateWorkflow(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	id, err := pathID(r)
 	if err != nil {
-		Fail(c, err)
+		Fail(w, err)
 		return
 	}
 	var req struct {
@@ -64,126 +68,131 @@ func (h *Handler) UpdateWorkflow(ctx context.Context, c *app.RequestContext) {
 		IsActive    *bool   `json:"is_active"`
 		Status      *int16  `json:"status"`
 	}
-	if err := c.BindAndValidate(&req); err != nil {
-		Fail(c, err)
+	if err := decodeJSON(w, r, &req); err != nil {
+		Fail(w, err)
 		return
 	}
-	if err := h.svcs.Workflow.Update(ctx, userID(c), id, &service.WorkflowUpdateInput{
+	if err := h.svcs.Workflow.Update(ctx, userID(r), id, &service.WorkflowUpdateInput{
 		Name: req.Name, Description: req.Description, DSL: req.DSL,
 		IsActive: req.IsActive, Status: req.Status,
 	}); err != nil {
-		Fail(c, err)
+		Fail(w, err)
 		return
 	}
-	w, err := h.svcs.Workflow.Get(ctx, userID(c), id)
+	workflow, err := h.svcs.Workflow.Get(ctx, userID(r), id)
 	if err != nil {
-		Fail(c, err)
+		Fail(w, err)
 		return
 	}
-	OK(c, w)
+	OK(w, workflow)
 }
 
-// DeleteWorkflow DELETE /api/v1/workflows/:id
-func (h *Handler) DeleteWorkflow(ctx context.Context, c *app.RequestContext) {
-	id, err := pathID(c)
+// DeleteWorkflow requests an owner-filtered definition deletion.
+func (h *Handler) DeleteWorkflow(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	id, err := pathID(r)
 	if err != nil {
-		Fail(c, err)
+		Fail(w, err)
 		return
 	}
-	if err := h.svcs.Workflow.Delete(ctx, userID(c), id); err != nil {
-		Fail(c, err)
+	if err := h.svcs.Workflow.Delete(ctx, userID(r), id); err != nil {
+		Fail(w, err)
 		return
 	}
-	OK(c, nil)
+	OK(w, nil)
 }
 
-// ValidateWorkflow POST /api/v1/workflows/validate —— DSL 静态校验。
-func (h *Handler) ValidateWorkflow(ctx context.Context, c *app.RequestContext) {
+// ValidateWorkflow parses and statically validates the supplied DSL without saving it.
+func (h *Handler) ValidateWorkflow(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		DSL string `json:"dsl"`
 	}
-	if err := c.BindAndValidate(&req); err != nil {
-		Fail(c, err)
+	if err := decodeJSON(w, r, &req); err != nil {
+		Fail(w, err)
 		return
 	}
 	if err := h.svcs.Workflow.Validate(req.DSL); err != nil {
-		Fail(c, err)
+		Fail(w, err)
 		return
 	}
-	OK(c, map[string]any{"valid": true})
+	OK(w, map[string]any{"valid": true})
 }
 
-// RunWorkflowReq 执行请求。
+// RunWorkflowReq selects a saved workflow and supplies its initial state object.
 type RunWorkflowReq struct {
 	WorkflowID int64          `json:"workflow_id"`
 	Input      map[string]any `json:"input"`
 }
 
-// RunWorkflow POST /api/v1/workflows/run —— 同步执行。
-func (h *Handler) RunWorkflow(ctx context.Context, c *app.RequestContext) {
+// RunWorkflow waits for execution to return and responds with the persisted run record.
+func (h *Handler) RunWorkflow(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
 	var req RunWorkflowReq
-	if err := c.BindAndValidate(&req); err != nil {
-		Fail(c, err)
+	if err := decodeJSON(w, r, &req); err != nil {
+		Fail(w, err)
 		return
 	}
-	run, err := h.svcs.Workflow.Run(ctx, userID(c), &service.RunInput{
+	run, err := h.svcs.Workflow.Run(ctx, userID(r), &service.RunInput{
 		WorkflowID: req.WorkflowID, Input: req.Input,
 	})
 	if err != nil {
-		Fail(c, err)
+		Fail(w, err)
 		return
 	}
-	OK(c, run)
+	OK(w, run)
 }
 
-// ApproveReq HITL 审批请求。
+// ApproveReq carries an explicit approval decision for a waiting workflow run.
 type ApproveReq struct {
 	Approved bool   `json:"approved"`
 	Comment  string `json:"comment"`
 }
 
-// ApproveRun POST /api/v1/workflows/runs/:id/approve
-func (h *Handler) ApproveRun(ctx context.Context, c *app.RequestContext) {
-	runID, err := pathID(c)
+// ApproveRun resumes or rejects a waiting owned run using the submitted decision.
+func (h *Handler) ApproveRun(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	runID, err := pathID(r)
 	if err != nil {
-		Fail(c, err)
+		Fail(w, err)
 		return
 	}
 	var req ApproveReq
-	if err := c.BindAndValidate(&req); err != nil {
-		Fail(c, err)
+	if err := decodeJSON(w, r, &req); err != nil {
+		Fail(w, err)
 		return
 	}
-	run, err := h.svcs.Workflow.Approve(ctx, userID(c), runID, req.Approved)
+	run, err := h.svcs.Workflow.Approve(ctx, userID(r), runID, req.Approved)
 	if err != nil {
-		Fail(c, err)
+		Fail(w, err)
 		return
 	}
-	OK(c, run)
+	OK(w, run)
 }
 
-// ListRuns GET /api/v1/workflows/runs?workflow_id=
-func (h *Handler) ListRuns(ctx context.Context, c *app.RequestContext) {
-	wfID, _ := parseID(string(c.Query("workflow_id")))
-	list, total, err := h.svcs.Workflow.ListRuns(ctx, userID(c), wfID, parsePagination(c))
+// ListRuns lists the caller's workflow runs, optionally restricted to one workflow.
+func (h *Handler) ListRuns(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	wfID, _ := parseID(string(r.URL.Query().Get("workflow_id")))
+	list, total, err := h.svcs.Workflow.ListRuns(ctx, userID(r), wfID, parsePagination(r))
 	if err != nil {
-		Fail(c, err)
+		Fail(w, err)
 		return
 	}
-	OK(c, map[string]any{"list": list, "total": total})
+	OK(w, map[string]any{"list": list, "total": total})
 }
 
-// GetRun GET /api/v1/workflows/runs/:id —— 执行详情（含步骤轨迹）。
-func (h *Handler) GetRun(ctx context.Context, c *app.RequestContext) {
-	runID, err := pathID(c)
+// GetRun returns an owned run with its persisted step snapshots.
+func (h *Handler) GetRun(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	runID, err := pathID(r)
 	if err != nil {
-		Fail(c, err)
+		Fail(w, err)
 		return
 	}
-	run, err := h.svcs.Workflow.GetWorkflowRun(ctx, userID(c), runID)
+	run, err := h.svcs.Workflow.GetWorkflowRun(ctx, userID(r), runID)
 	if err != nil {
-		Fail(c, err)
+		Fail(w, err)
 		return
 	}
-	OK(c, run)
+	OK(w, run)
 }

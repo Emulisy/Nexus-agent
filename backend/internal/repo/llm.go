@@ -1,4 +1,6 @@
-// LLM 供应商与模型配置数据访问。
+// Model persistence stores provider credentials and model metadata without decrypting keys.
+// Provider associations are preloaded for descriptor assembly. Startup preset
+// changes can share a transaction-bound catalog handle under an advisory lock.
 package repo
 
 import (
@@ -9,36 +11,48 @@ import (
 	"github.com/chengpeng-cp/nexus-agent/internal/model"
 )
 
-// LLMRepo 供应商/模型配置表。
+// LLMRepo reads and writes model providers/configurations using either the shared DB or a transaction handle.
 type LLMRepo struct {
 	db *gorm.DB
 }
 
+// WithCatalogLock serializes cooperating API/worker startup catalog changes.
+// The PostgreSQL transaction-level advisory lock is held through the callback;
+// returning its error rolls back all catalog writes and releases the lock.
+func (r *LLMRepo) WithCatalogLock(ctx context.Context, fn func(*LLMRepo) error) error {
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Exec("SELECT pg_advisory_xact_lock(735920104)").Error; err != nil {
+			return err
+		}
+		return fn(&LLMRepo{db: tx})
+	})
+}
+
 // ---- Provider ----
 
-// CreateProvider 创建供应商。
+// CreateProvider inserts an already-encrypted provider record and populates its ID.
 func (r *LLMRepo) CreateProvider(ctx context.Context, p *model.ModelProvider) error {
 	return r.db.WithContext(ctx).Create(p).Error
 }
 
-// UpdateProvider 更新供应商。
+// UpdateProvider saves the complete provider; partial request merging happens in ModelService.
 func (r *LLMRepo) UpdateProvider(ctx context.Context, p *model.ModelProvider) error {
 	return r.db.WithContext(ctx).Save(p).Error
 }
 
-// DeleteProvider 删除供应商（级联约束在 DDL 层）。
+// DeleteProvider delegates referential restrictions and dependent-row behavior to database constraints.
 func (r *LLMRepo) DeleteProvider(ctx context.Context, id int64) error {
 	return r.db.WithContext(ctx).Delete(&model.ModelProvider{}, id).Error
 }
 
-// ListProviders 供应商列表。
+// ListProviders returns providers in ID order; callers must mask credentials before returning public views.
 func (r *LLMRepo) ListProviders(ctx context.Context) ([]model.ModelProvider, error) {
 	var list []model.ModelProvider
 	err := r.db.WithContext(ctx).Order("id ASC").Find(&list).Error
 	return list, err
 }
 
-// GetProvider 按 ID 查询供应商（解密 API Key 前置步骤）。
+// GetProvider loads one provider, including encrypted key material required by service-side decryption.
 func (r *LLMRepo) GetProvider(ctx context.Context, id int64) (*model.ModelProvider, error) {
 	var p model.ModelProvider
 	if err := r.db.WithContext(ctx).First(&p, id).Error; err != nil {
@@ -49,22 +63,22 @@ func (r *LLMRepo) GetProvider(ctx context.Context, id int64) (*model.ModelProvid
 
 // ---- ModelConfig ----
 
-// CreateModel 创建模型配置。
+// CreateModel inserts model metadata that references a persisted provider.
 func (r *LLMRepo) CreateModel(ctx context.Context, m *model.ModelConfig) error {
 	return r.db.WithContext(ctx).Create(m).Error
 }
 
-// UpdateModel 更新模型配置。
+// UpdateModel saves a complete model; callers should avoid retaining stale provider associations during updates.
 func (r *LLMRepo) UpdateModel(ctx context.Context, m *model.ModelConfig) error {
 	return r.db.WithContext(ctx).Save(m).Error
 }
 
-// DeleteModel 删除模型配置。
+// DeleteModel removes one configuration and lets database constraints enforce dependent references.
 func (r *LLMRepo) DeleteModel(ctx context.Context, id int64) error {
 	return r.db.WithContext(ctx).Delete(&model.ModelConfig{}, id).Error
 }
 
-// ListModels 模型列表（可按类型过滤，含供应商关联）。
+// ListModels preloads providers and orders by priority/ID, optionally filtering the model type.
 func (r *LLMRepo) ListModels(ctx context.Context, typ string) ([]model.ModelConfig, error) {
 	var list []model.ModelConfig
 	q := r.db.WithContext(ctx).Preload("Provider").Order("priority ASC, id ASC")
@@ -75,7 +89,7 @@ func (r *LLMRepo) ListModels(ctx context.Context, typ string) ([]model.ModelConf
 	return list, err
 }
 
-// GetModel 按 ID 查询模型配置（含供应商）。
+// GetModel preloads the provider so the service can validate availability and decrypt its credential.
 func (r *LLMRepo) GetModel(ctx context.Context, id int64) (*model.ModelConfig, error) {
 	var m model.ModelConfig
 	if err := r.db.WithContext(ctx).Preload("Provider").First(&m, id).Error; err != nil {
@@ -84,18 +98,26 @@ func (r *LLMRepo) GetModel(ctx context.Context, id int64) (*model.ModelConfig, e
 	return &m, nil
 }
 
-// DefaultModel 按别名取默认模型（config.llm.default_chat 指向 alias）。
+// DefaultModel first tries the requested alias among currently available models.
+// Models and providers must be enabled; cloud providers need a nonempty stored
+// key, while Ollama may be keyless. Missing aliases fall back to is_default,
+// priority, then ID ordering; decryption validity is checked later by the service.
 func (r *LLMRepo) DefaultModel(ctx context.Context, alias string, typ string) (*model.ModelConfig, error) {
 	var m model.ModelConfig
-	q := r.db.WithContext(ctx).Preload("Provider")
-	err := q.Where("alias = ? AND type = ? AND status = 1", alias, typ).First(&m).Error
+	available := func() *gorm.DB {
+		return r.db.WithContext(ctx).Model(&model.ModelConfig{}).Preload("Provider").
+			Joins("JOIN model_providers ON model_providers.id = model_configs.provider_id").
+			Where("model_configs.type = ? AND model_configs.status = 1 AND model_providers.status = 1", typ).
+			Where("model_providers.api_key <> '' OR model_providers.code = ?", "ollama")
+	}
+	err := available().Where("model_configs.alias = ?", alias).First(&m).Error
 	if err == nil {
 		return &m, nil
 	}
 	if err != gorm.ErrRecordNotFound {
 		return nil, err
 	}
-	// 别名不存在时回退：该类型的 is_default 或 priority 最小者
-	err = q.Where("type = ? AND status = 1", typ).Order("is_default DESC, priority ASC").First(&m).Error
+	// Fall back to the default model of this type, then the lowest priority value.
+	err = available().Order("model_configs.is_default DESC, model_configs.priority ASC, model_configs.id ASC").First(&m).Error
 	return &m, err
 }

@@ -1,48 +1,50 @@
-// Handler 依赖持有与通用辅助。
+// HTTP handlers share the service container and request parsing helpers.
+// Authentication claims are installed by middleware; business services receive
+// the extracted user ID rather than depending on HTTP request objects.
 package api
 
 import (
+	"net/http"
 	"strconv"
 
-	"github.com/cloudwego/hertz/pkg/app"
-
+	"github.com/chengpeng-cp/nexus-agent/internal/pkg/errcode"
+	"github.com/chengpeng-cp/nexus-agent/internal/security"
 	"github.com/chengpeng-cp/nexus-agent/internal/service"
 )
 
-// Handler HTTP 处理器集合（持有全部业务服务）。
+// Handler holds application services used by the registered HTTP endpoints.
 type Handler struct {
 	svcs *service.Services
 }
 
-// New 构造。
+// New binds handlers to an already-constructed service container.
 func New(svcs *service.Services) *Handler { return &Handler{svcs: svcs} }
 
-// pathID 解析路径参数 :id。
-func pathID(c *app.RequestContext) (int64, error) {
-	return parseID(c.Param("id"))
+// pathID parses the conventional {id} route parameter as a signed 64-bit integer.
+func pathID(r *http.Request) (int64, error) {
+	return parseID(r.PathValue("id"))
 }
 
-// parseID 字符串 ID 解析。
+// parseID translates malformed base-10 IDs into client validation errors.
 func parseID(s string) (int64, error) {
-	return strconv.ParseInt(s, 10, 64)
+	id, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return 0, errcode.ErrInvalidParam.WithMsg("Invalid resource ID").WithCause(err)
+	}
+	return id, nil
 }
 
-// userID 从中间件注入的上下文中取当前用户 ID。
-func userID(c *app.RequestContext) int64 {
-	if v, ok := c.Get(claimsKey); ok {
-		if claims, ok := v.(*userClaims); ok {
-			return claims.UserID
-		}
+// userID reads claims populated by Auth and returns zero when claims are absent.
+// Protected endpoints rely on the route group's authentication middleware to
+// reject unauthenticated requests before this helper is called.
+func userID(r *http.Request) int64 {
+	if claims, ok := r.Context().Value(claimsKey).(*security.Claims); ok {
+		return claims.UserID
 	}
 	return 0
 }
 
-// isAdmin 当前用户是否管理员。
-func isAdmin(c *app.RequestContext) bool {
-	if v, ok := c.Get(claimsKey); ok {
-		if claims, ok := v.(*userClaims); ok {
-			return claims.Role == "admin"
-		}
-	}
-	return false
+func isAdmin(r *http.Request) bool {
+	claims, ok := r.Context().Value(claimsKey).(*security.Claims)
+	return ok && claims.Role == "admin"
 }

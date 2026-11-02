@@ -1,4 +1,3 @@
-// 内置工具：计算器与时间日期（教学示例：最简单的工具长什么样）。
 package tool
 
 import (
@@ -11,13 +10,16 @@ import (
 	"github.com/expr-lang/expr"
 )
 
-// RegisterSimple 注册 calculator 与 datetime。
+// RegisterSimple installs calculation and date/time handlers that require no
+// external service configuration.
 func RegisterSimple(r Registry) {
 	r.Register("calculator", runCalculator)
 	r.Register("datetime", runDatetime)
 }
 
-// runCalculator 表达式求值（expr-lang 沙箱化求值，不使用 eval）。
+// runCalculator evaluates a numeric expression with expr built-ins disabled.
+// The result must be float64; integral values omit decimals and fractional values
+// use six decimal places for predictable model-readable output.
 func runCalculator(_ context.Context, args map[string]any, _ string) (string, error) {
 	expression, _ := args["expression"].(string)
 	if expression == "" {
@@ -37,14 +39,16 @@ func runCalculator(_ context.Context, args map[string]any, _ string) (string, er
 	if !ok {
 		return "", fmt.Errorf("expression must be numeric")
 	}
-	// 整数值去掉小数点（1.0 -> 1）
+
 	if val == math.Trunc(val) {
 		return strconv.FormatFloat(val, 'f', -1, 64), nil
 	}
 	return strconv.FormatFloat(val, 'f', 6, 64), nil
 }
 
-// runDatetime 时间日期操作。
+// runDatetime supports current time, calendar-day addition, and days until the
+// next January 1. Operations use the requested IANA timezone, defaulting to
+// Asia/Shanghai; diff is not a general comparison of two supplied timestamps.
 func runDatetime(_ context.Context, args map[string]any, _ string) (string, error) {
 	operation, _ := args["operation"].(string)
 	tz := "Asia/Shanghai"
@@ -68,9 +72,9 @@ func runDatetime(_ context.Context, args map[string]any, _ string) (string, erro
 		case int:
 			days = v
 		}
+		// Calendar arithmetic retains local wall-clock semantics across timezone changes.
 		return now.AddDate(0, 0, days).Format(time.RFC3339), nil
 	case "diff":
-		// 演示版：返回今天到年底的天数（教学可扩展为自定义两日期）
 		yearEnd := time.Date(now.Year()+1, 1, 1, 0, 0, 0, 0, loc)
 		return fmt.Sprintf("%d days until %d-01-01",
 			int(yearEnd.Sub(now).Hours()/24), now.Year()+1), nil

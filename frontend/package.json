@@ -1,8 +1,8 @@
 {
-  "name": "nexus-agent-frontend",
+  "name": "supa-agent-frontend",
   "private": true,
   "version": "1.0.0",
-  "description": "NexusAgent Web 控制台 —— React + TypeScript + TailwindCSS + GSAP 生产级前端",
+  "description": "SupaAgent web console built with React, TypeScript, TailwindCSS, and GSAP",
   "type": "module",
   "scripts": {
     "dev": "vite",

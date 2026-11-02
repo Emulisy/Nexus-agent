@@ -6,7 +6,10 @@
     "module": "ESNext",
     "skipLibCheck": true,
 
-    /* 打包模式：由 Vite 负责转译，tsc 只做类型检查 */
+    /**
+     * Vite owns transformation and bundling; tsc checks the same import layout
+     * without emitting a second JavaScript build.
+     */
     "moduleResolution": "bundler",
     "allowImportingTsExtensions": true,
     "isolatedModules": true,
@@ -14,14 +17,14 @@
     "noEmit": true,
     "jsx": "react-jsx",
 
-    /* 严格度：企业级基线 */
+    /** Reject unused locals/parameters and unsafe fallthrough as part of normal builds. */
     "strict": true,
     "noUnusedLocals": true,
     "noUnusedParameters": true,
     "noFallthroughCasesInSwitch": true,
     "forceConsistentCasingInFileNames": true,
 
-    /* 路径别名：与 vite.config.ts 的 resolve.alias 保持一致 */
+    /** Keep this alias aligned with resolve.alias in vite.config.ts. */
     "baseUrl": ".",
     "paths": {
       "@/*": ["src/*"]

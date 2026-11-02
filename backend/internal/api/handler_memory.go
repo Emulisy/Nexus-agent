@@ -1,62 +1,66 @@
-// 记忆管理接口。
+// Memory management endpoints operate on the signed-in user's stored memories.
+// Deletion and archival are distinct operations; manual extraction uses an
+// existing owned session rather than accepting arbitrary conversation text.
 package api
 
 import (
-	"context"
-
-	"github.com/cloudwego/hertz/pkg/app"
+	"net/http"
 
 	"github.com/chengpeng-cp/nexus-agent/internal/service"
 )
 
-// ListMemories GET /api/v1/memories —— 我的长期记忆列表。
-func (h *Handler) ListMemories(ctx context.Context, c *app.RequestContext) {
-	list, total, err := h.svcs.Memory.List(ctx, userID(c), parsePagination(c))
+// ListMemories returns the caller's memory records, including archived records.
+func (h *Handler) ListMemories(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	list, total, err := h.svcs.Memory.List(ctx, userID(r), parsePagination(r))
 	if err != nil {
-		Fail(c, err)
+		Fail(w, err)
 		return
 	}
-	OK(c, map[string]any{"list": list, "total": total})
+	OK(w, map[string]any{"list": list, "total": total})
 }
 
-// DeleteMemory DELETE /api/v1/memories/:id
-func (h *Handler) DeleteMemory(ctx context.Context, c *app.RequestContext) {
-	id, err := pathID(c)
+// DeleteMemory delegates ownership checking and record/vector removal to the service.
+func (h *Handler) DeleteMemory(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	id, err := pathID(r)
 	if err != nil {
-		Fail(c, err)
+		Fail(w, err)
 		return
 	}
-	if err := h.svcs.Memory.Delete(ctx, userID(c), id); err != nil {
-		Fail(c, err)
+	if err := h.svcs.Memory.Delete(ctx, userID(r), id); err != nil {
+		Fail(w, err)
 		return
 	}
-	OK(c, nil)
+	OK(w, nil)
 }
 
-// ArchiveMemory POST /api/v1/memories/:id/archive —— 归档（软失效）。
-func (h *Handler) ArchiveMemory(ctx context.Context, c *app.RequestContext) {
-	id, err := pathID(c)
+// ArchiveMemory marks an owned memory inactive for recall while retaining its stored record.
+func (h *Handler) ArchiveMemory(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	id, err := pathID(r)
 	if err != nil {
-		Fail(c, err)
+		Fail(w, err)
 		return
 	}
-	if err := h.svcs.Memory.Archive(ctx, userID(c), id); err != nil {
-		Fail(c, err)
+	if err := h.svcs.Memory.Archive(ctx, userID(r), id); err != nil {
+		Fail(w, err)
 		return
 	}
-	OK(c, nil)
+	OK(w, nil)
 }
 
-// ExtractMemory POST /api/v1/memories/extract —— 手动抽取会话记忆。
-func (h *Handler) ExtractMemory(ctx context.Context, c *app.RequestContext) {
+// ExtractMemory requests immediate extraction from the specified owned session.
+func (h *Handler) ExtractMemory(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
 	var req service.ExtractInput
-	if err := c.BindAndValidate(&req); err != nil {
-		Fail(c, err)
+	if err := decodeJSON(w, r, &req); err != nil {
+		Fail(w, err)
 		return
 	}
-	if err := h.svcs.Memory.ExtractNow(ctx, userID(c), &req); err != nil {
-		Fail(c, err)
+	if err := h.svcs.Memory.ExtractNow(ctx, userID(r), &req); err != nil {
+		Fail(w, err)
 		return
 	}
-	OK(c, nil)
+	OK(w, nil)
 }

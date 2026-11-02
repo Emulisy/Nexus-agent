@@ -1,6 +1,7 @@
-// Package security 安全模块：JWT 认证。
-// 轻量方案：bcrypt 存储密码 + 双 Token（Access 15min / Refresh 7d）。
-// Refresh Token 存 Redis 白名单，支持主动吊销（登出）。
+// Package security provides JWTs, credential encryption, and input normalization.
+// JWTManager issues access and refresh tokens with distinct issuers and random
+// IDs. Redis allowlisting/rotation belongs to AuthService; cryptographic token
+// parsing alone does not check refresh-token revocation.
 package security
 
 import (
@@ -13,7 +14,7 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 )
 
-// Claims JWT 载荷。
+// Claims carries user identity/role alongside the JWT library's registered expiry, issuer, and token-ID fields.
 type Claims struct {
 	UserID   int64  `json:"uid"`
 	Role     string `json:"role"`
@@ -21,27 +22,29 @@ type Claims struct {
 	jwt.RegisteredClaims
 }
 
-// TokenPair 双 Token。
+// TokenPair returns signed access/refresh strings and the access lifetime; internal UserID is excluded from JSON.
 type TokenPair struct {
 	AccessToken  string `json:"access_token"`
 	RefreshToken string `json:"refresh_token"`
-	ExpiresIn    int64  `json:"expires_in"` // access 有效期（秒）
-	UserID       int64  `json:"-"`          // 签发对象（白名单存储用，不外泄）
+	ExpiresIn    int64  `json:"expires_in"` // Access token lifetime in seconds.
+	UserID       int64  `json:"-"`          // Subject used for the refresh allowlist; excluded from JSON.
 }
 
-// JWTManager JWT 签发与校验。
+// JWTManager stores immutable signing bytes and issuance lifetimes shared by authentication requests.
 type JWTManager struct {
 	secret     []byte
 	accessTTL  time.Duration
 	refreshTTL time.Duration
 }
 
-// NewJWTManager 构造。
+// NewJWTManager copies configured signing/lifetime values into the issuer; production configuration validates secrets.
 func NewJWTManager(secret string, accessTTL, refreshTTL time.Duration) *JWTManager {
 	return &JWTManager{secret: []byte(secret), accessTTL: accessTTL, refreshTTL: refreshTTL}
 }
 
-// Generate 签发双 Token。
+// Generate signs an HS256 access token and refresh token with separate expiries/issuers.
+// Both receive independent cryptographically random IDs, ensuring repeated
+// issuance within one timestamp still produces distinct refresh tokens.
 func (m *JWTManager) Generate(userID int64, role, username string) (*TokenPair, error) {
 	now := time.Now()
 	accessID, err := newTokenID()
@@ -83,6 +86,7 @@ func (m *JWTManager) Generate(userID int64, role, username string) (*TokenPair, 
 	return &TokenPair{AccessToken: accessStr, RefreshToken: refreshStr, ExpiresIn: int64(m.accessTTL.Seconds()), UserID: userID}, nil
 }
 
+// newTokenID encodes 16 random bytes as hex for the JWT ID claim and propagates entropy-source errors.
 func newTokenID() (string, error) {
 	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {
@@ -91,7 +95,9 @@ func newTokenID() (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
-// Parse 解析并校验 Token。isRefresh 区分两类 token 的 issuer。
+// Parse verifies a HMAC-signed token using registered-claim validation and the expected issuer.
+// Expired-token errors remain recognizable through errors.Is. isRefresh selects
+// the refresh issuer; allowlist membership is checked separately by AuthService.
 func (m *JWTManager) Parse(tokenStr string, isRefresh bool) (*Claims, error) {
 	claims := &Claims{}
 	_, err := jwt.ParseWithClaims(tokenStr, claims, func(t *jwt.Token) (any, error) {
@@ -102,7 +108,7 @@ func (m *JWTManager) Parse(tokenStr string, isRefresh bool) (*Claims, error) {
 	})
 	if err != nil {
 		if errors.Is(err, jwt.ErrTokenExpired) {
-			return nil, err // 上层区分过期
+			return nil, err
 		}
 		return nil, fmt.Errorf("parse token: %w", err)
 	}
@@ -116,6 +122,5 @@ func (m *JWTManager) Parse(tokenStr string, isRefresh bool) (*Claims, error) {
 	return claims, nil
 }
 
-// AccessTTL / RefreshTTL 供 Redis 白名单设置过期时间。
-func (m *JWTManager) AccessTTL() time.Duration  { return m.accessTTL }
+// RefreshTTL exposes the configured lifetime used for Redis refresh-token set expiration.
 func (m *JWTManager) RefreshTTL() time.Duration { return m.refreshTTL }

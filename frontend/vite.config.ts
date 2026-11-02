@@ -1,23 +1,29 @@
-// Vite 配置：开发代理 / 路径别名 / 构建产物切分。
+/**
+ * Vite integration, source alias, local API proxy, and vendor chunk boundaries.
+ * NX_BACKEND_URL is read from the process environment at configuration load time.
+ * The frontend uses same-origin /api requests; static hosting must provide an
+ * equivalent reverse proxy, while Vite preview inherits the server proxy.
+ */
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 import tailwindcss from '@tailwindcss/vite';
 import path from 'node:path';
 
-// 后端 Hertz 默认监听 8080（configs/config.yaml: http.port）。
 const BACKEND = process.env.NX_BACKEND_URL ?? 'http://localhost:8080';
 
 export default defineConfig({
   plugins: [tailwindcss(), react()],
   resolve: {
     alias: {
-      // 统一以 @ 指向 src，避免 ../../../ 地狱
       '@': path.resolve(__dirname, 'src'),
     },
   },
   server: {
     port: 5173,
-    // 开发期把 /api 与 /healthz 代理到后端，前后端同源，免 CORS 配置
+    /**
+     * Proxy same-origin REST and SSE requests to the separately started API.
+     * Vite preview uses this configuration unless a preview-specific proxy overrides it.
+     */
     proxy: {
       '/api': { target: BACKEND, changeOrigin: true },
       '/healthz': { target: BACKEND, changeOrigin: true },
@@ -28,7 +34,10 @@ export default defineConfig({
     chunkSizeWarningLimit: 1200,
     rollupOptions: {
       output: {
-        // 大依赖单独分包：GSAP 动画库与 Markdown 渲染器按需加载
+        /**
+         * Keep large shared libraries in stable vendor groups instead of duplicating
+         * them across the application entry chunk.
+         */
         manualChunks: {
           gsap: ['gsap'],
           markdown: ['react-markdown', 'remark-gfm'],

@@ -1,20 +1,21 @@
-// 智能分块（td.md §8.5，Ep 06）。
-//
-// 递归字符切分：分隔符优先级 "\n\n" → "\n" → "。" → "." → " " → ""，
-// 带重叠（overlap）保证语义连续 —— 这是 RAG 检索质量的第一决定因素。
+// Package splitter divides loaded page text into overlapping chunks. Markdown
+// heading boundaries are considered first, followed by prioritized separators;
+// rune counts keep chunk sizes independent of UTF-8 byte width.
 package splitter
 
 import (
 	"strings"
 )
 
-// Splitter 分块器。
+// Splitter stores the target chunk size and retained trailing overlap, in runes.
+// Configuration is normalized by New before splitting begins.
 type Splitter struct {
-	ChunkSize   int // 块大小（字符）
-	ChunkOverlap int // 重叠（字符）
+	ChunkSize    int
+	ChunkOverlap int
 }
 
-// New 构造。
+// New defaults non-positive sizes to 512 and replaces invalid overlap values
+// with one eighth of the chunk size.
 func New(size, overlap int) *Splitter {
 	if size <= 0 {
 		size = 512
@@ -25,27 +26,30 @@ func New(size, overlap int) *Splitter {
 	return &Splitter{ChunkSize: size, ChunkOverlap: overlap}
 }
 
-// Chunk 一个分块。
+// Chunk is an ordered fragment with its originating page number. Seq is assigned
+// within each call to Split before records are assembled by the indexer.
 type Chunk struct {
-	Seq     int    // 序号
-	Content string // 内容
-	Page    int    // 来源页码
+	Seq     int
+	Content string
+	Page    int
 }
 
-// Split 单页内容切分（标题感知：markdown 标题优先分段）。
+// Split separates heading sections, splits each section, and numbers the final
+// fragments in output order. All fragments retain the supplied page number.
 func (s *Splitter) Split(content string, page int) []Chunk {
 	var chunks []Chunk
 	for _, seg := range splitByHeading(content) {
 		chunks = append(chunks, s.recursiveSplit(seg, page)...)
 	}
-	// 编号
+
 	for i := range chunks {
 		chunks[i].Seq = i
 	}
 	return chunks
 }
 
-// splitByHeading markdown 标题切分（# 开头行）。
+// splitByHeading starts a new section at lines beginning with # when there is
+// already text buffered, keeping the heading with the following section.
 func splitByHeading(content string) []string {
 	lines := strings.Split(content, "\n")
 	var segs []string
@@ -63,10 +67,13 @@ func splitByHeading(content string) []string {
 	return segs
 }
 
-// separators 分隔符优先级。
+// separators is ordered from paragraph boundaries to smaller textual boundaries.
+// The empty separator leaves the hard rune-splitting fallback available.
 var separators = []string{"\n\n", "\n", "。", ".", " ", ""}
 
-// recursiveSplit 递归切分核心。
+// recursiveSplit tries the first applicable separator, recursively handles large
+// segments, and packs the remaining pieces into a chunk buffer. Completed buffers
+// seed the next buffer with a trailing overlap to retain neighboring context.
 func (s *Splitter) recursiveSplit(text string, page int) []Chunk {
 	text = strings.TrimSpace(text)
 	if text == "" {
@@ -76,7 +83,6 @@ func (s *Splitter) recursiveSplit(text string, page int) []Chunk {
 		return []Chunk{{Content: text, Page: page}}
 	}
 
-	// 找到能切分的第一个分隔符
 	for _, sep := range separators {
 		if !strings.Contains(text, sep) {
 			continue
@@ -86,15 +92,16 @@ func (s *Splitter) recursiveSplit(text string, page int) []Chunk {
 		var buf strings.Builder
 
 		for _, p := range parts {
-			// 单段就超长：递归更细粒度
 			if len([]rune(p)) > s.ChunkSize && sep != "" {
 				chunks = append(chunks, s.recursiveSplit(p, page)...)
 				continue
 			}
-			// 缓冲拼接：超过块大小则收块，并回填 overlap
+
 			if len([]rune(buf.String()+p)) > s.ChunkSize && buf.Len() > 0 {
 				chunks = append(chunks, Chunk{Content: strings.TrimSpace(buf.String()), Page: page})
-				// overlap：取上一块尾部
+
+				// Copy the previous buffer tail before resetting it; overlap is measured in
+				// characters, not bytes.
 				tail := []rune(buf.String())
 				if len(tail) > s.ChunkOverlap {
 					tail = tail[len(tail)-s.ChunkOverlap:]
@@ -111,7 +118,9 @@ func (s *Splitter) recursiveSplit(text string, page int) []Chunk {
 			return chunks
 		}
 	}
-	// 兜底：硬切
+
+	// If separator-based packing produced no chunks, split directly by runes with
+	// the configured overlap and stop after the final fragment.
 	r := []rune(text)
 	var chunks []Chunk
 	for i := 0; i < len(r); i += s.ChunkSize - s.ChunkOverlap {
@@ -127,7 +136,8 @@ func (s *Splitter) recursiveSplit(text string, page int) []Chunk {
 	return chunks
 }
 
-// splitKeepSep 按分隔符切分并保留分隔符在段尾。
+// splitKeepSep retains each delimiter at the end of its segment so separators
+// are not lost when adjacent pieces are reassembled into chunks.
 func splitKeepSep(text, sep string) []string {
 	if sep == "" {
 		return []string{text}

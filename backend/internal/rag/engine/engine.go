@@ -1,13 +1,10 @@
-// Package engine RAG 引擎（td.md §8.5，Ep 06-08）。
+// Package engine coordinates document indexing and hybrid retrieval. Indexing
+// persists chunks in PostgreSQL before writing embeddings to Milvus. Retrieval
+// combines vector and keyword rankings, restores candidate text, optionally reranks,
+// and formats references for inclusion in a model prompt.
 //
-// 三段式管线，对应三个教学阶段：
-//
-//	Index（索引）：Load → Split → Chunk 落库(PG) → 批量 Embed → Milvus Upsert
-//	Retrieve（检索）：稠密(Milvus HNSW) + 关键词(PG BM25-lite) → RRF 融合 → Rerank
-//	Enhance（增强）：top-k 分块拼装上下文 + 引用信息（refs）
-//
-// 设计要点：检索是"双路召回"，稠密向量擅长语义、关键词擅长专有名词/编号，
-// 两者互补后用 RRF（Reciprocal Rank Fusion）融合 —— 这是工业界标配方案。
+// Document loading and job status belong to the worker; model and knowledge-base
+// access checks belong to the service layer.
 package engine
 
 import (
@@ -19,34 +16,41 @@ import (
 	"github.com/chengpeng-cp/nexus-agent/internal/config"
 	"github.com/chengpeng-cp/nexus-agent/internal/llm"
 	"github.com/chengpeng-cp/nexus-agent/internal/model"
-	"github.com/chengpeng-cp/nexus-agent/internal/observability"
 	"github.com/chengpeng-cp/nexus-agent/internal/rag/loader"
 	"github.com/chengpeng-cp/nexus-agent/internal/rag/splitter"
 	"github.com/chengpeng-cp/nexus-agent/internal/vector"
 )
 
-// ChunkRepo 分块数据访问（repo 层实现注入）。
+// ChunkRepo supplies chunk persistence and keyword ranking without exposing the
+// database client to the engine. Vector records use the IDs assigned by BatchCreate.
 type ChunkRepo interface {
-	// BatchCreate 批量写入分块（事务）。
+	// BatchCreate inserts chunks together and populates their database IDs.
 	BatchCreate(ctx context.Context, chunks []model.DocumentChunk) error
-	// ListByDoc 拉取文档全部分块。
+
+	// ListByDoc returns the IDs needed to remove a document from vector storage.
 	ListByDoc(ctx context.Context, docID int64) ([]model.DocumentChunk, error)
-	// DeleteByDoc 删除文档全部分块。
+
+	// DeleteByDoc removes persisted chunks after their vectors have been deleted.
 	DeleteByDoc(ctx context.Context, docID int64) error
-	// KeywordSearch 关键词检索（PG 侧，BM25-lite 打分）。
+
+	// KeywordSearch returns scored, text-bearing candidates from PostgreSQL.
 	KeywordSearch(ctx context.Context, kbID int64, terms []string, limit int) ([]ScoredChunk, error)
-	// ListByIDs 按 ID 批量回查（Milvus 只存向量+ID，稠密命中需回表取 content）。
+
+	// ListByIDs hydrates dense hits because vector search returns IDs and scores.
 	ListByIDs(ctx context.Context, ids []int64) ([]model.DocumentChunk, error)
 }
 
-// ScoredChunk 带分数的分块（关键词检索结果）。
+// ScoredChunk is a keyword candidate with its original database record and source
+// filename. Its raw score is used for ranking before reciprocal rank fusion.
 type ScoredChunk struct {
 	Chunk    model.DocumentChunk
-	Filename string  // 所属文档名
-	Score    float64 // BM25-lite 分数
+	Filename string
+	Score    float64
 }
 
-// Engine RAG 引擎。
+// Engine shares the model gateway and vector store between indexing and retrieval.
+// Model callbacks resolve the currently selected embedding/rerank descriptors rather
+// than keeping credentials in the indexing configuration.
 type Engine struct {
 	gateway *llm.Gateway
 	store   vector.Store
@@ -54,32 +58,35 @@ type Engine struct {
 	cfg     *config.RAG
 	dim     int
 
-	embedMdl  func() *llm.ModelDescriptor // Embedding 模型取值函数（每次调用实时解析，配置变更即时生效）
-	rerankMdl func() *llm.ModelDescriptor // Rerank 模型取值函数（返回 nil 时跳过 rerank）
+	embedMdl  func() *llm.ModelDescriptor
+	rerankMdl func() *llm.ModelDescriptor
 }
 
-// New 构造引擎。
+// New wires storage, model access, retrieval parameters, and collection dimension.
+// SetModels must supply the embedding resolver before indexing or retrieval.
 func New(gateway *llm.Gateway, store vector.Store, repo ChunkRepo, cfg *config.RAG, dim int) *Engine {
 	return &Engine{gateway: gateway, store: store, repo: repo, cfg: cfg, dim: dim}
 }
 
-// SetModels 注入模型取值函数（service 层的 Default*() 实时解析器）。
+// SetModels installs model descriptor callbacks. The rerank callback may return
+// nil to skip that optional stage; embedding requires a usable descriptor.
 func (e *Engine) SetModels(embed, rerank func() *llm.ModelDescriptor) {
 	e.embedMdl = embed
 	e.rerankMdl = rerank
 }
 
-// EnsureKBVectorCollection 确保知识库的 Milvus 集合存在。
+// EnsureKBVectorCollection creates the knowledge-base collection and its index
+// when needed, using the configured embedding dimension.
 func (e *Engine) EnsureKBVectorCollection(ctx context.Context, collection string) error {
 	return e.store.EnsureCollection(ctx, collection, e.dim)
 }
 
-// IndexDocument 文档索引管线（worker 的 doc-etl 消费此方法）。
-//
-//	输入：已从对象存储下载并解析好的文档原文
-//	状态机：chunking → embedding → ready / failed（由调用方推进）
+// IndexDocument splits loaded pages, persists chunks to obtain stable IDs, and
+// batches embeddings into the knowledge-base vector collection. It updates the
+// passed document count fields but leaves status transitions and saving that
+// document to the worker. Database and vector writes are not one transaction.
 func (e *Engine) IndexDocument(ctx context.Context, kb *model.KnowledgeBase, doc *model.Document, loaded *loader.LoadedDoc) error {
-	// ① 分块：按知识库自定义参数（无则用全局配置）
+	// Knowledge-base settings override global split defaults when positive.
 	chunkSize, chunkOverlap := kb.ChunkSize, kb.ChunkOverlap
 	if chunkSize <= 0 {
 		chunkSize = e.cfg.ChunkSize
@@ -89,8 +96,8 @@ func (e *Engine) IndexDocument(ctx context.Context, kb *model.KnowledgeBase, doc
 	}
 	sp := splitter.New(chunkSize, chunkOverlap)
 
-	// ② 落库：分块先写入 PG（Milvus 主键 = chunk.ID，必须先有 ID）
-	// 页码等定位信息存 Meta JSONB（{"page":3}），引用时回显"第几页"
+	// Retain page metadata alongside text so references can point back to the
+	// source page after either dense or keyword retrieval.
 	var chunks []model.DocumentChunk
 	for _, page := range loaded.Pages {
 		for _, c := range sp.Split(page.Content, page.Page) {
@@ -106,16 +113,16 @@ func (e *Engine) IndexDocument(ctx context.Context, kb *model.KnowledgeBase, doc
 	if len(chunks) == 0 {
 		return fmt.Errorf("document produced no chunks: %s", doc.Filename)
 	}
+	// Persist first: Milvus primary keys must be the generated PostgreSQL chunk
+	// IDs, not positional indexes within this document.
 	if err := e.repo.BatchCreate(ctx, chunks); err != nil {
 		return fmt.Errorf("save chunks: %w", err)
 	}
 
-	// ③ 向量化（分批，避免单次请求过大）
 	if err := e.embedChunks(ctx, kb.MilvusCollection, chunks); err != nil {
 		return fmt.Errorf("embed chunks: %w", err)
 	}
 
-	// ④ 统计回填
 	doc.ChunkCount = len(chunks)
 	totalTokens := 0
 	for _, c := range chunks {
@@ -125,8 +132,11 @@ func (e *Engine) IndexDocument(ctx context.Context, kb *model.KnowledgeBase, doc
 	return nil
 }
 
-// embedChunks 批量向量化并写入 Milvus。
+// embedChunks limits upstream embedding batch size and writes vectors with
+// chunk identity and citation metadata. A failed batch stops this indexing attempt;
+// previously stored chunks or batches are not rolled back here.
 func (e *Engine) embedChunks(ctx context.Context, collection string, chunks []model.DocumentChunk) error {
+	// Use a bounded default batch when no positive batch size is configured.
 	batch := e.cfg.BatchEmbed
 	if batch <= 0 {
 		batch = 64
@@ -147,6 +157,7 @@ func (e *Engine) embedChunks(ctx context.Context, collection string, chunks []mo
 			return err
 		}
 
+		// Pair vectors with the same input ordering used by the embedding request.
 		records := make([]vector.Record, 0, len(batchChunks))
 		for j, c := range batchChunks {
 			c.TokenCount = llm.EstimateTokens(c.Content)
@@ -168,7 +179,8 @@ func (e *Engine) embedChunks(ctx context.Context, collection string, chunks []mo
 	return nil
 }
 
-// DeleteDocument 删除文档的全部分块与向量（文档删除时调用）。
+// DeleteDocument deletes vectors before chunk rows so their IDs remain available
+// for cleanup. A vector-delete failure stops before the database deletion.
 func (e *Engine) DeleteDocument(ctx context.Context, collection string, docID int64) error {
 	chunks, err := e.repo.ListByDoc(ctx, docID)
 	if err != nil {
@@ -186,7 +198,8 @@ func (e *Engine) DeleteDocument(ctx context.Context, collection string, docID in
 	return e.repo.DeleteByDoc(ctx, docID)
 }
 
-// Ref 检索引用（前端展示"参考来源"）。
+// Ref is a retrieved citation with document identity, source position, text, and
+// its final relevance score. Score is an RRF value unless reranking succeeded.
 type Ref struct {
 	ChunkID    int64   `json:"chunk_id"`
 	DocumentID int64   `json:"document_id"`
@@ -196,40 +209,35 @@ type Ref struct {
 	Score      float32 `json:"score"`
 }
 
-// Retrieve 混合检索主流程：稠密 + 关键词 → RRF → (Rerank) → 截断。
+// Retrieve performs dense search, then keyword search, reciprocal rank fusion,
+// text hydration, optional reranking, and top-k selection. Dense failures abort
+// this knowledge-base retrieval; keyword and rerank failures retain the usable
+// results from earlier stages.
 func (e *Engine) Retrieve(ctx context.Context, kb *model.KnowledgeBase, query string) ([]Ref, error) {
-	// ① 稠密检索
-	start := recordStart()
+	// Embed the query with the same embedding resolver used during indexing.
 	queryVecs, err := e.gateway.Embed(ctx, e.embedMdl(), []string{query})
 	if err != nil {
 		return nil, err
 	}
 	denseHits, err := e.store.Search(ctx, kb.MilvusCollection, queryVecs[0], int(e.cfg.DenseTopK))
-	observeStage("dense", start)
 	if err != nil {
 		return nil, fmt.Errorf("dense search: %w", err)
 	}
 
-	// ② 关键词检索（PG 侧自研 BM25-lite）
-	start = recordStart()
+	// Keyword ranking complements dense semantics with literal terms and CJK
+	// bigrams. It runs independently of the vector similarity score scale.
 	terms := extractTerms(query)
 	kwHits, err := e.repo.KeywordSearch(ctx, kb.ID, terms, int(e.cfg.SparseTopK))
-	observeStage("bm25", start)
 	if err != nil {
-		// 关键词路失败不阻塞整体（降级为纯稠密），教学点：多路召回要互相兜底
+		// Continue with dense retrieval if keyword search is unavailable.
 		kwHits = nil
 	}
 
-	// ③ RRF 融合
-	start = recordStart()
 	fused := Fuse(denseHits, kwHits, e.cfg.RRFK, int(e.cfg.FusedTopN))
-	observeStage("fused", start)
 
-	// ④ 回表补正文（必须早于 rerank）
-	// 稠密路只从 Milvus 拿到 chunk id（向量库不存正文），命中项需回 PG 补 content；
-	// 关键词路的项本身来自 PG 已带正文，故只对 content 为空的项按 ID 批量回查，避免无谓 IO。
-	// 顺序约束：rerank 是把正文送进精排模型打分的，必须在回表之后执行 ——
-	// 若颠倒，稠密路命中的候选会以空文档参与打分而被误判为不相关。
+	// Dense search supplies IDs rather than full records. Load missing text before
+	// reranking so candidates are scored against their actual content; keyword hits
+	// already carry text and do not need another lookup.
 	needLookup := make([]int64, 0, len(fused))
 	for _, f := range fused {
 		if f.Chunk.Content == "" {
@@ -237,6 +245,8 @@ func (e *Engine) Retrieve(ctx context.Context, kb *model.KnowledgeBase, query st
 		}
 	}
 	if len(needLookup) > 0 {
+		// Hydration is best effort. A failed lookup leaves the corresponding candidate
+		// without text rather than discarding all fused results.
 		if found, err := e.repo.ListByIDs(ctx, needLookup); err == nil {
 			byID := make(map[int64]model.DocumentChunk, len(found))
 			for _, ch := range found {
@@ -244,38 +254,32 @@ func (e *Engine) Retrieve(ctx context.Context, kb *model.KnowledgeBase, query st
 			}
 			for i := range fused {
 				if ch, ok := byID[fused[i].Chunk.ID]; ok {
-					fused[i].Chunk = ch // 回填正文/文档归属
+					fused[i].Chunk = ch
 				}
 			}
 		}
-		// 回查失败不阻塞检索：content 为空的引用前端按"仅命中"展示
 	}
 
-	// ⑤ Rerank（可选：取值函数返回 nil 描述符时跳过）
 	var final []FusedChunk
 	reranked := false
+	// Reranking is optional. If its upstream call fails, preserve the RRF order.
 	if rerankMdl := e.rerankMdl(); rerankMdl != nil && len(fused) > 0 {
-		start = recordStart()
 		final, err = e.rerank(ctx, fused, query)
-		observeStage("rerank", start)
 		if err != nil {
-			// rerank 失败降级用融合序
 			final = fused
 		} else {
-			reranked = true // 分数已替换为 rerank 相关性分（0~1 量纲）
+			reranked = true
 		}
 	} else {
 		final = fused
 	}
 
-	// ⑥ 分数阈值过滤 + 截断
-	// ScoreThreshold 按 rerank 相关性分量纲标定（0~1）；未 rerank 时 f.Score 是 RRF 融合分，
-	// 量级仅 1/(k+rank) ≈ 0.01~0.03，两者不可比 —— 故阈值只在 rerank 生效时应用，
-	// 否则一律按 FinalTopK 截断（否则高阈值会误杀全部结果，实际只返回前 3 条）。
+	// The configured relevance threshold uses reranker scores, not the much smaller
+	// RRF score scale. Retain the first three candidates when available, subject to
+	// FinalTopK, then apply the threshold to later reranked candidates.
 	refs := make([]Ref, 0, len(final))
 	for _, f := range final {
 		if reranked && e.cfg.ScoreThreshold > 0 && f.Score < e.cfg.ScoreThreshold && len(refs) >= 3 {
-			// 前三条即使低分也保留（避免空引用），之后按阈值过滤
 			break
 		}
 		if len(refs) >= int(e.cfg.FinalTopK) {
@@ -293,19 +297,23 @@ func (e *Engine) Retrieve(ctx context.Context, kb *model.KnowledgeBase, query st
 	return refs, nil
 }
 
-// BuildContext 把检索引用拼装成注入 prompt 的上下文文本。
+// BuildContext gives retrieved passages stable one-based citation labels in the
+// order returned. The service combines this text with the agent persona and memory
+// before sending the system prompt to the model.
 func BuildContext(refs []Ref) string {
 	if len(refs) == 0 {
 		return ""
 	}
-	out := "以下是知识库中检索到的参考资料（回答时请标注 [来源编号]）：\n"
+	out := "The following references were retrieved from the knowledge base. Cite them in your answer using [source number]:\n"
 	for i, r := range refs {
-		out += fmt.Sprintf("\n[%d] %s 第%d页:\n%s\n", i+1, r.Filename, r.Page, r.Content)
+		out += fmt.Sprintf("\n[%d] %s, page %d:\n%s\n", i+1, r.Filename, r.Page, r.Content)
 	}
 	return out
 }
 
-// rerank 用 LLM 网关的重排序能力对融合结果重排。
+// rerank sends candidate texts to the selected model and maps returned indexes
+// back to full chunk records. Invalid indexes are ignored rather than indexing
+// outside the candidate slice.
 func (e *Engine) rerank(ctx context.Context, fused []FusedChunk, query string) ([]FusedChunk, error) {
 	docs := make([]string, 0, len(fused))
 	for _, f := range fused {
@@ -321,18 +329,8 @@ func (e *Engine) rerank(ctx context.Context, fused []FusedChunk, query string) (
 			continue
 		}
 		f := fused[r.Index]
-		f.Score = r.Score // rerank 分数替换融合分数
+		f.Score = r.Score
 		out = append(out, f)
 	}
 	return out, nil
-}
-
-// ---- 指标辅助 ----
-
-func recordStart() (t observabilityTimer) { return nowTimer() }
-
-func observeStage(stage string, t observabilityTimer) {
-	if m := observability.MetricsInstance(); m != nil {
-		m.RAGSearchSeconds.WithLabelValues(stage).Observe(elapsedSeconds(t))
-	}
 }

@@ -1,6 +1,5 @@
-// 基础设施：Milvus 向量库。
-// 开发态可用 Milvus Lite（pip install milvus-lite 后 `milvus-lite serve` 起本地 server），
-// 生产/演示用 docker standalone —— Go SDK 统一以 gRPC remote 方式连接。
+// Milvus connection and schema helpers define the vector layout used by the store.
+// SQL records remain authoritative for ownership and document/memory text.
 package infra
 
 import (
@@ -13,7 +12,8 @@ import (
 	"github.com/chengpeng-cp/nexus-agent/internal/config"
 )
 
-// NewMilvus 初始化 Milvus gRPC 客户端。
+// NewMilvus connects through the SDK using the configured gRPC address.
+// Collection creation and loading are separate operations in the vector store.
 func NewMilvus(ctx context.Context, cfg *config.Milvus) (client.Client, error) {
 	cli, err := client.NewClient(ctx, client.Config{
 		Address: cfg.Addr,
@@ -24,17 +24,12 @@ func NewMilvus(ctx context.Context, cfg *config.Milvus) (client.Client, error) {
 	return cli, nil
 }
 
-// ---- 集合 Schema 定义（对齐 td.md §5.3）----
-
-// KBVectorField 知识库集合的稠密向量字段名。
+// KBVectorField is the dense field name shared by KB collection creation and search.
 const KBVectorField = "dense"
 
-// NewKBSchema 构建知识库集合 Schema。
-//
-//	字段：id(主键=chunk_id) / doc_id / seq / content / page / dense(FLOAT_VECTOR)
-//	注：Milvus 2.5 原生 BM25 全文检索需增加 SPARSE_FLOAT_VECTOR 字段 + BM25 Function，
-//	教学版关键词检索由 internal/rag/retriever/keyword.go 自研实现（可对照讲解），
-//	原生稀疏检索作为进阶演进（见 td.md §13）。
+// NewKBSchema uses SQL chunk IDs as primary keys and keeps document, sequence,
+// page, and text metadata beside the dense vector. dim must match the embeddings
+// written into this collection.
 func NewKBSchema(collection string, dim int) *entity.Schema {
 	return entity.NewSchema().WithName(collection).WithDescription("nexus-agent knowledge base").
 		WithField(entity.NewField().WithName("id").WithDataType(entity.FieldTypeInt64).WithIsPrimaryKey(true)).
@@ -46,7 +41,8 @@ func NewKBSchema(collection string, dim int) *entity.Schema {
 			WithDataType(entity.FieldTypeFloatVector).WithDim(int64(dim)))
 }
 
-// NewMemorySchema 构建长期记忆集合 Schema。
+// NewMemorySchema separates user/Agent-scoped memory vectors from KB collections.
+// Its primary keys refer to SQL memory rows; the vector field is named vector.
 func NewMemorySchema(collection string, dim int) *entity.Schema {
 	return entity.NewSchema().WithName(collection).WithDescription("nexus-agent long-term memory").
 		WithField(entity.NewField().WithName("id").WithDataType(entity.FieldTypeInt64).WithIsPrimaryKey(true)).
@@ -56,7 +52,8 @@ func NewMemorySchema(collection string, dim int) *entity.Schema {
 			WithDataType(entity.FieldTypeFloatVector).WithDim(int64(dim)))
 }
 
-// NewHNSWIndex 构建 HNSW 向量索引（COSINE 度量，M=16 efC=200）。
+// NewHNSWIndex creates a cosine HNSW index with M=16 and efConstruction=200.
+// The vector dimension belongs to the collection schema rather than these index settings.
 func NewHNSWIndex(dim int) (entity.Index, error) {
 	return entity.NewIndexHNSW(entity.COSINE, 16, 200)
 }

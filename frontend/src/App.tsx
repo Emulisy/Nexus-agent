@@ -1,6 +1,7 @@
 /**
- * 应用根组件：全局只做一次 bootstrap（refresh_token 会话恢复）。
- * 路由守卫依赖 auth.bootstrapped，恢复完成前显示启动屏。
+ * Application root for session restoration, routing, and global notifications.
+ * Route guards read auth.bootstrapped so protected pages wait for the initial
+ * refresh-token exchange before deciding whether to redirect.
  */
 import { useEffect } from 'react';
 import { useAuth } from '@/stores/auth';

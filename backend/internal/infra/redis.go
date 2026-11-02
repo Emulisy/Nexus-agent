@@ -1,4 +1,4 @@
-// 基础设施：Redis。
+// Redis client initialization is shared by refresh-token storage and document queues.
 package infra
 
 import (
@@ -11,9 +11,9 @@ import (
 	"github.com/chengpeng-cp/nexus-agent/internal/config"
 )
 
-// NewRedis 初始化 Redis 客户端。
-// Redis 在本项目承担四种角色：缓存（会话窗口）、限流（令牌桶）、
-// 锁（Worker 抢占）、消息队列（Streams，文档 ETL / 评估任务）。
+// NewRedis builds a client for the selected address, credentials, and logical DB.
+// It verifies connectivity with a five-second context before returning the client;
+// the caller controls the lifetime of a successfully returned connection pool.
 func NewRedis(ctx context.Context, cfg *config.Redis) (*redis.Client, error) {
 	cli := redis.NewClient(&redis.Options{
 		Addr:     cfg.Addr,
@@ -28,16 +28,3 @@ func NewRedis(ctx context.Context, cfg *config.Redis) (*redis.Client, error) {
 	}
 	return cli, nil
 }
-
-// Stream 相关 Key 常量（对齐 td.md §5.4）。
-const (
-	StreamDocETL = "stream:doc-etl" // 文档 ETL 任务流
-	StreamEval   = "stream:eval"    // 评估任务流
-	StreamDLQ    = "stream:dlq"     // 死信队列
-)
-
-// Consumer Group 常量。
-const (
-	GroupDocETL = "doc-etl-workers"
-	GroupEval   = "eval-workers"
-)

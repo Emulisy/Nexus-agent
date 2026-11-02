@@ -1,4 +1,7 @@
-// Agent 管理服务。
+// Agent management resolves defaults and applies owner-aware persistence.
+// Shared agents can be read by users, while update/delete queries require an
+// exact owner match. Editable fields are merged explicitly to avoid zeroing
+// stored configuration that the form does not submit.
 package service
 
 import (
@@ -15,23 +18,23 @@ import (
 	"github.com/chengpeng-cp/nexus-agent/internal/repo"
 )
 
-// AgentService Agent CRUD。
+// AgentService validates agent definitions and resolves their default chat-model configuration.
 type AgentService struct {
 	repos *repo.Repos
 	cfg   *config.Config
 }
 
-// NewAgentService 构造。
+// NewAgentService shares repositories and default-model configuration with agent management.
 func NewAgentService(repos *repo.Repos, cfg *config.Config) *AgentService {
 	return &AgentService{repos: repos, cfg: cfg}
 }
 
-// List 列表。
+// List returns shared and caller-owned agents using the requested keyword and pagination.
 func (s *AgentService) List(ctx context.Context, userID int64, q pagination.Query) ([]model.Agent, int64, error) {
 	return s.repos.Agent.ListForUser(ctx, userID, q.Keyword, q.Offset(), q.Limit())
 }
 
-// Get 详情。
+// Get maps an inaccessible or missing agent to not-found and preserves other storage failures as internal errors.
 func (s *AgentService) Get(ctx context.Context, userID, id int64) (*model.Agent, error) {
 	ag, err := s.repos.Agent.GetByIDForUser(ctx, id, userID)
 	if err != nil {
@@ -43,21 +46,18 @@ func (s *AgentService) Get(ctx context.Context, userID, id int64) (*model.Agent,
 	return ag, nil
 }
 
-// Create 创建（工具绑定做一次合法校验）。
+// Create validates the name, fills an absent type/model, and checks named tool bindings.
+// The caller's user ID replaces any supplied owner. Missing model configuration
+// is reported before insertion so the required foreign key is never left zero.
 func (s *AgentService) Create(ctx context.Context, userID int64, ag *model.Agent) error {
 	if ag.Name == "" {
-		return errcode.ErrInvalidParam.WithMsg("name 不能为空")
+		return errcode.ErrInvalidParam.WithMsg("name is required")
 	}
 	if ag.Type == "" {
 		ag.Type = model.AgentTypeExpert
 	}
-	// model_config_id 有非空外键：未指定时自动绑定默认对话模型
-	if ag.ModelConfigID <= 0 {
-		m, err := s.repos.LLM.DefaultModel(ctx, s.cfg.LLM.DefaultChat, modelTypeChat)
-		if err != nil {
-			return errcode.ErrInvalidParam.WithMsg("未找到可用的对话模型配置，请先在模型管理中启用").WithCause(err)
-		}
-		ag.ModelConfigID = m.ID
+	if err := s.resolveModel(ctx, ag); err != nil {
+		return err
 	}
 	if err := s.validateToolBindings(ctx, ag.Tools); err != nil {
 		return err
@@ -66,20 +66,20 @@ func (s *AgentService) Create(ctx context.Context, userID int64, ag *model.Agent
 	return s.repos.Agent.Create(ctx, ag)
 }
 
-// Update 更新（读-改-写：仅覆盖编辑表单管理的字段）。
-//
-// repo 层 Save 是全量覆写，而前端编辑表单只提交部分字段；
-// 若直接把请求绑定的结构体落库，未提交字段会被零值覆盖
-// （config=NULL 违反非空约束直接 500，top_p/memory_window/status 静默清零）。
+// Update reads an accessible agent, checks tool codes, and copies editable fields.
+// The owner-filtered update then writes those fields, including explicit zero
+// values, while preserving fallback, top_p, window size, and other stored settings.
 func (s *AgentService) Update(ctx context.Context, userID int64, ag *model.Agent) error {
 	cur, err := s.Get(ctx, userID, ag.ID)
 	if err != nil {
 		return err
 	}
+	if err := s.resolveModel(ctx, ag); err != nil {
+		return err
+	}
 	if err := s.validateToolBindings(ctx, ag.Tools); err != nil {
 		return err
 	}
-	// 表单管理的字段：以请求为准
 	cur.Name = ag.Name
 	cur.Type = ag.Type
 	cur.Description = ag.Description
@@ -92,11 +92,32 @@ func (s *AgentService) Update(ctx context.Context, userID int64, ag *model.Agent
 	cur.MemoryLongEnabled = ag.MemoryLongEnabled
 	cur.KBIDs = ag.KBIDs
 	cur.Tools = ag.Tools
-	// 非表单字段（fallback/top_p/memory_window/config/status/is_preset 等）保留库中原值
+	// Keep fields outside the edit form unchanged.
 	return s.repos.Agent.UpdateForUser(ctx, cur, userID)
 }
 
-// Delete 删除。
+// resolveModel applies the same default and availability checks on create/edit.
+// A blank model must not write a zero foreign key, or bind a disabled/non-chat model.
+func (s *AgentService) resolveModel(ctx context.Context, ag *model.Agent) error {
+	var m *model.ModelConfig
+	var err error
+	if ag.ModelConfigID <= 0 {
+		m, err = s.repos.LLM.DefaultModel(ctx, s.cfg.LLM.DefaultChat, modelTypeChat)
+	} else {
+		m, err = s.repos.LLM.GetModel(ctx, ag.ModelConfigID)
+	}
+	if err != nil {
+		return errcode.ErrInvalidParam.WithMsg("No available chat model was found. Choose an enabled model in Models.").WithCause(err)
+	}
+	if m.Type != modelTypeChat || m.Status != 1 || m.Provider == nil || m.Provider.Status != 1 ||
+		(m.Provider.APIKey == "" && m.Provider.Code != "ollama") {
+		return errcode.ErrInvalidParam.WithMsg("The selected model is unavailable. Choose an enabled chat model with a configured provider.")
+	}
+	ag.ModelConfigID = m.ID
+	return nil
+}
+
+// Delete removes only an owned agent; no matching owner/ID pair becomes agent-not-found.
 func (s *AgentService) Delete(ctx context.Context, userID, id int64) error {
 	err := s.repos.Agent.DeleteForUser(ctx, id, userID)
 	if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -108,27 +129,33 @@ func (s *AgentService) Delete(ctx context.Context, userID, id int64) error {
 	return nil
 }
 
-// validateToolBindings 校验工具绑定中的 tool_code 均存在。
+// validateToolBindings validates both numeric-ID and stable-code bindings against
+// enabled catalog records, rather than silently dropping invalid ID-only entries.
 func (s *AgentService) validateToolBindings(ctx context.Context, toolsJSON []byte) error {
 	if len(toolsJSON) == 0 || string(toolsJSON) == "[]" {
 		return nil
 	}
 	bindings, err := parseToolBindings(toolsJSON)
 	if err != nil {
-		return errcode.ErrInvalidParam.WithMsg("tools 格式不合法")
+		return errcode.ErrInvalidParam.WithMsg("Invalid tools format")
 	}
 	for _, b := range bindings {
-		if b.ToolCode == "" {
-			continue
+		var t *model.Tool
+		if b.ToolCode != "" {
+			t, err = s.repos.Tool.GetByCode(ctx, b.ToolCode)
+		} else if b.ToolID > 0 {
+			t, err = s.repos.Tool.GetByID(ctx, b.ToolID)
+		} else {
+			return errcode.ErrInvalidParam.WithMsg("Each tool binding must include a tool ID or code")
 		}
-		if _, err := s.repos.Tool.GetByCode(ctx, b.ToolCode); err != nil {
-			return errcode.ErrToolNotFound.WithMsg("工具 %q 不存在", b.ToolCode)
+		if err != nil || t.Status != 1 {
+			return errcode.ErrToolNotFound.WithMsg("A selected tool is missing or disabled. Refresh the tool list and select it again.")
 		}
 	}
 	return nil
 }
 
-// parseToolBindings 解析绑定 JSON。
+// parseToolBindings decodes the ID/code subset needed for agent management validation.
 func parseToolBindings(raw []byte) ([]struct {
 	ToolID   int64  `json:"tool_id"`
 	ToolCode string `json:"tool_code"`

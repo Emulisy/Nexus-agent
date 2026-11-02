@@ -1,172 +1,195 @@
-// 知识库接口：KB CRUD / 文档上传 / 分块查看 / 检索测试台。
+// Knowledge-base endpoints cover ownership-scoped metadata, document upload,
+// chunk inspection, and retrieval results. Uploads are size-bounded while reading;
+// the service coordinates object storage and asynchronous document ingestion.
 package api
 
 import (
-	"context"
+	"errors"
 	"io"
-
-	"github.com/cloudwego/hertz/pkg/app"
+	"net/http"
 
 	"github.com/chengpeng-cp/nexus-agent/internal/model"
+	"github.com/chengpeng-cp/nexus-agent/internal/pkg/errcode"
 	"github.com/chengpeng-cp/nexus-agent/internal/service"
 )
 
-// ListKBs GET /api/v1/kbs
-func (h *Handler) ListKBs(ctx context.Context, c *app.RequestContext) {
-	list, total, err := h.svcs.KB.ListKBs(ctx, userID(c), parsePagination(c))
+// ListKBs returns the current user's knowledge bases with pagination metadata.
+func (h *Handler) ListKBs(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	list, total, err := h.svcs.KB.ListKBs(ctx, userID(r), parsePagination(r))
 	if err != nil {
-		Fail(c, err)
+		Fail(w, err)
 		return
 	}
-	OK(c, map[string]any{"list": list, "total": total})
+	OK(w, map[string]any{"list": list, "total": total})
 }
 
-// GetKB GET /api/v1/kbs/:id
-func (h *Handler) GetKB(ctx context.Context, c *app.RequestContext) {
-	id, err := pathID(c)
+// GetKB returns a knowledge base through the service's ownership-filtered lookup.
+func (h *Handler) GetKB(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	id, err := pathID(r)
 	if err != nil {
-		Fail(c, err)
+		Fail(w, err)
 		return
 	}
-	kb, err := h.svcs.KB.GetKB(ctx, userID(c), id)
+	kb, err := h.svcs.KB.GetKB(ctx, userID(r), id)
 	if err != nil {
-		Fail(c, err)
+		Fail(w, err)
 		return
 	}
-	OK(c, kb)
+	OK(w, kb)
 }
 
-// CreateKB POST /api/v1/kbs
-func (h *Handler) CreateKB(ctx context.Context, c *app.RequestContext) {
+// CreateKB binds metadata and delegates owner assignment and vector-collection creation.
+func (h *Handler) CreateKB(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
 	kb := &model.KnowledgeBase{}
-	if err := c.BindAndValidate(kb); err != nil {
-		Fail(c, err)
+	if err := decodeJSON(w, r, kb); err != nil {
+		Fail(w, err)
 		return
 	}
-	if err := h.svcs.KB.CreateKB(ctx, userID(c), kb); err != nil {
-		Fail(c, err)
+	if err := h.svcs.KB.CreateKB(ctx, userID(r), kb); err != nil {
+		Fail(w, err)
 		return
 	}
-	OK(c, kb)
+	OK(w, kb)
 }
 
-// DeleteKB DELETE /api/v1/kbs/:id
-func (h *Handler) DeleteKB(ctx context.Context, c *app.RequestContext) {
-	id, err := pathID(c)
+// DeleteKB delegates document and vector cleanup after ownership validation.
+func (h *Handler) DeleteKB(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	id, err := pathID(r)
 	if err != nil {
-		Fail(c, err)
+		Fail(w, err)
 		return
 	}
-	if err := h.svcs.KB.DeleteKB(ctx, userID(c), id); err != nil {
-		Fail(c, err)
+	if err := h.svcs.KB.DeleteKB(ctx, userID(r), id); err != nil {
+		Fail(w, err)
 		return
 	}
-	OK(c, nil)
+	OK(w, nil)
 }
 
-// UploadDoc POST /api/v1/kbs/:id/documents（multipart 文件上传）。
-func (h *Handler) UploadDoc(ctx context.Context, c *app.RequestContext) {
-	id, err := pathID(c)
+// UploadDoc reads the multipart file using a MaxDocSize+1 limit.
+// The extra byte lets the service distinguish oversized content from a file
+// exactly at the limit without loading an unbounded upload into memory.
+func (h *Handler) UploadDoc(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	id, err := pathID(r)
 	if err != nil {
-		Fail(c, err)
+		Fail(w, err)
 		return
 	}
-	fh, err := c.FormFile("file")
+	r.Body = http.MaxBytesReader(w, r.Body, service.MaxDocSize+(1<<20))
+	defer func() {
+		if r.MultipartForm != nil {
+			_ = r.MultipartForm.RemoveAll()
+		}
+	}()
+	f, fh, err := r.FormFile("file")
 	if err != nil {
-		Fail(c, err)
-		return
-	}
-	f, err := fh.Open()
-	if err != nil {
-		Fail(c, err)
+		var limitError *http.MaxBytesError
+		if errors.As(err, &limitError) {
+			Fail(w, errcode.ErrFileTooLarge.WithCause(err))
+		} else {
+			Fail(w, errcode.ErrInvalidParam.WithMsg("A multipart file upload is required").WithCause(err))
+		}
 		return
 	}
 	defer f.Close()
 	data, err := io.ReadAll(io.LimitReader(f, service.MaxDocSize+1))
 	if err != nil {
-		Fail(c, err)
+		Fail(w, err)
 		return
 	}
-	doc, err := h.svcs.KB.UploadDoc(ctx, userID(c), id, fh.Filename, data)
+	doc, err := h.svcs.KB.UploadDoc(ctx, userID(r), id, fh.Filename, data)
 	if err != nil {
-		Fail(c, err)
+		Fail(w, err)
 		return
 	}
-	OK(c, doc)
+	OK(w, doc)
 }
 
-// ListDocs GET /api/v1/kbs/:id/documents
-func (h *Handler) ListDocs(ctx context.Context, c *app.RequestContext) {
-	id, err := pathID(c)
+// ListDocs lists documents only after the service verifies knowledge-base ownership.
+func (h *Handler) ListDocs(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	id, err := pathID(r)
 	if err != nil {
-		Fail(c, err)
+		Fail(w, err)
 		return
 	}
-	list, total, err := h.svcs.KB.ListDocs(ctx, userID(c), id, parsePagination(c))
+	list, total, err := h.svcs.KB.ListDocs(ctx, userID(r), id, parsePagination(r))
 	if err != nil {
-		Fail(c, err)
+		Fail(w, err)
 		return
 	}
-	OK(c, map[string]any{"list": list, "total": total})
+	OK(w, map[string]any{"list": list, "total": total})
 }
 
-// DeleteDoc DELETE /api/v1/kbs/:id/documents/:docID
-func (h *Handler) DeleteDoc(ctx context.Context, c *app.RequestContext) {
-	id, err := pathID(c)
+// DeleteDoc supplies both route IDs so the service can verify the document belongs to that KB.
+func (h *Handler) DeleteDoc(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	id, err := pathID(r)
 	if err != nil {
-		Fail(c, err)
+		Fail(w, err)
 		return
 	}
-	docID, err := pathIDNamed(c, "docID")
+	docID, err := pathIDNamed(r, "docID")
 	if err != nil {
-		Fail(c, err)
+		Fail(w, err)
 		return
 	}
-	if err := h.svcs.KB.DeleteDoc(ctx, userID(c), id, docID); err != nil {
-		Fail(c, err)
+	if err := h.svcs.KB.DeleteDoc(ctx, userID(r), id, docID); err != nil {
+		Fail(w, err)
 		return
 	}
-	OK(c, nil)
+	OK(w, nil)
 }
 
-// ListChunks GET /api/v1/documents/:docID/chunks —— 分块查看（ETL 质量排查）。
-func (h *Handler) ListChunks(ctx context.Context, c *app.RequestContext) {
-	docID, err := pathIDNamed(c, "docID")
+// ListChunks resolves document ownership through its knowledge base before listing chunks.
+func (h *Handler) ListChunks(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	docID, err := pathIDNamed(r, "docID")
 	if err != nil {
-		Fail(c, err)
+		Fail(w, err)
 		return
 	}
-	list, total, err := h.svcs.KB.ListChunks(ctx, userID(c), docID, parsePagination(c))
+	list, total, err := h.svcs.KB.ListChunks(ctx, userID(r), docID, parsePagination(r))
 	if err != nil {
-		Fail(c, err)
+		Fail(w, err)
 		return
 	}
-	OK(c, map[string]any{"list": list, "total": total})
+	OK(w, map[string]any{"list": list, "total": total})
 }
 
-// TestRetrieve POST /api/v1/kbs/:id/retrieve —— 检索测试台（调试召回质量）。
-func (h *Handler) TestRetrieve(ctx context.Context, c *app.RequestContext) {
-	id, err := pathID(c)
+// TestRetrieve returns references without generating a model answer.
+// The query is bound from the request object; both GET and POST routes currently
+// point to this handler.
+func (h *Handler) TestRetrieve(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	id, err := pathID(r)
 	if err != nil {
-		Fail(c, err)
+		Fail(w, err)
 		return
 	}
 	var req struct {
 		Query string `json:"query"`
 	}
-	if err := c.BindAndValidate(&req); err != nil {
-		Fail(c, err)
+	if r.Method == http.MethodGet {
+		req.Query = r.URL.Query().Get("query")
+	} else if err := decodeJSON(w, r, &req); err != nil {
+		Fail(w, err)
 		return
 	}
-	refs, err := h.svcs.KB.TestRetrieve(ctx, userID(c), id, req.Query)
+	refs, err := h.svcs.KB.TestRetrieve(ctx, userID(r), id, req.Query)
 	if err != nil {
-		Fail(c, err)
+		Fail(w, err)
 		return
 	}
-	OK(c, refs)
+	OK(w, refs)
 }
 
-// pathIDNamed 按名字解析路径参数。
-func pathIDNamed(c *app.RequestContext, name string) (int64, error) {
-	return parseID(c.Param(name))
+// pathIDNamed parses a nonstandard ID parameter such as docID with the shared int64 parser.
+func pathIDNamed(r *http.Request, name string) (int64, error) {
+	return parseID(r.PathValue(name))
 }

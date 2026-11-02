@@ -1,4 +1,7 @@
-// RAG 数据访问：知识库 / 文档 / 分块（分块检索实现 engine.ChunkRepo 接口）。
+// RAG persistence manages KB/document metadata and indexed text chunks.
+// Owner-filtered KB methods are used by request-facing services, while ingestion
+// uses direct IDs after job lookup. Vector operations are outside this repository;
+// chunk IDs link PostgreSQL content to the corresponding Milvus entries.
 package repo
 
 import (
@@ -13,29 +16,29 @@ import (
 	"github.com/chengpeng-cp/nexus-agent/internal/rag/engine"
 )
 
-// KBRepo 知识库/文档/分块表。
+// KBRepo implements both management persistence and the retrieval engine's chunk repository.
 type KBRepo struct {
 	db *gorm.DB
 }
 
 // ---- KnowledgeBase ----
 
-// CreateKB 创建知识库（名称唯一性由 service 校验）。
+// CreateKB inserts metadata before the service derives the vector collection name from its generated ID.
 func (r *KBRepo) CreateKB(ctx context.Context, kb *model.KnowledgeBase) error {
 	return r.db.WithContext(ctx).Create(kb).Error
 }
 
-// UpdateKB 更新知识库。
+// UpdateKB saves complete KB metadata; creation uses it to store the derived collection name.
 func (r *KBRepo) UpdateKB(ctx context.Context, kb *model.KnowledgeBase) error {
 	return r.db.WithContext(ctx).Save(kb).Error
 }
 
-// DeleteKB 删除知识库（向量集合删除由 service 处理）。
+// DeleteKB deletes metadata; callers coordinate external vector cleanup before this operation.
 func (r *KBRepo) DeleteKB(ctx context.Context, id int64) error {
 	return r.db.WithContext(ctx).Delete(&model.KnowledgeBase{}, id).Error
 }
 
-// GetKB 详情。
+// GetKB loads a KB without ownership filtering for internal ingestion/processing paths.
 func (r *KBRepo) GetKB(ctx context.Context, id int64) (*model.KnowledgeBase, error) {
 	var kb model.KnowledgeBase
 	if err := r.db.WithContext(ctx).First(&kb, id).Error; err != nil {
@@ -44,7 +47,7 @@ func (r *KBRepo) GetKB(ctx context.Context, id int64) (*model.KnowledgeBase, err
 	return &kb, nil
 }
 
-// GetKBForUser returns a KB only when it belongs to the authenticated user.
+// GetKBForUser requires both the KB ID and owning user ID, returning not-found for inaccessible rows.
 func (r *KBRepo) GetKBForUser(ctx context.Context, id, userID int64) (*model.KnowledgeBase, error) {
 	var kb model.KnowledgeBase
 	if err := r.db.WithContext(ctx).Where("id = ? AND user_id = ?", id, userID).First(&kb).Error; err != nil {
@@ -53,7 +56,7 @@ func (r *KBRepo) GetKBForUser(ctx context.Context, id, userID int64) (*model.Kno
 	return &kb, nil
 }
 
-// ListKBs 知识库列表。
+// ListKBs lists active KBs; a positive user ID adds ownership filtering, while zero leaves the query unscoped.
 func (r *KBRepo) ListKBs(ctx context.Context, userID int64, offset, limit int) ([]model.KnowledgeBase, int64, error) {
 	var (
 		list  []model.KnowledgeBase
@@ -70,17 +73,7 @@ func (r *KBRepo) ListKBs(ctx context.Context, userID int64, offset, limit int) (
 	return list, total, err
 }
 
-// ListKBsByIDs 按 ID 集合取知识库（Agent 绑定的多个 KB）。
-func (r *KBRepo) ListKBsByIDs(ctx context.Context, ids []int64) ([]model.KnowledgeBase, error) {
-	if len(ids) == 0 {
-		return nil, nil
-	}
-	var list []model.KnowledgeBase
-	err := r.db.WithContext(ctx).Where("id IN ? AND status = 'active'", ids).Find(&list).Error
-	return list, err
-}
-
-// ListKBsByIDsForUser applies KB ownership to agent-configured retrieval.
+// ListKBsByIDsForUser restricts agent-bound KB IDs to active records owned by the current user.
 func (r *KBRepo) ListKBsByIDsForUser(ctx context.Context, ids []int64, userID int64) ([]model.KnowledgeBase, error) {
 	if len(ids) == 0 {
 		return nil, nil
@@ -92,17 +85,17 @@ func (r *KBRepo) ListKBsByIDsForUser(ctx context.Context, ids []int64, userID in
 
 // ---- Document ----
 
-// CreateDoc 创建文档记录。
+// CreateDoc inserts pending document metadata and provides the ID needed for its object-storage key.
 func (r *KBRepo) CreateDoc(ctx context.Context, d *model.Document) error {
 	return r.db.WithContext(ctx).Create(d).Error
 }
 
-// UpdateDoc 更新文档（ETL 状态机推进）。
+// UpdateDoc saves document metadata, including the ETL stage, counts, and processing error.
 func (r *KBRepo) UpdateDoc(ctx context.Context, d *model.Document) error {
 	return r.db.WithContext(ctx).Save(d).Error
 }
 
-// GetDoc 文档详情。
+// GetDoc loads document metadata by ID; request-facing callers check its parent KB ownership separately.
 func (r *KBRepo) GetDoc(ctx context.Context, id int64) (*model.Document, error) {
 	var d model.Document
 	if err := r.db.WithContext(ctx).First(&d, id).Error; err != nil {
@@ -111,7 +104,7 @@ func (r *KBRepo) GetDoc(ctx context.Context, id int64) (*model.Document, error) 
 	return &d, nil
 }
 
-// ListDocs 文档列表。
+// ListDocs returns a KB's documents newest first, with a separate total-count query.
 func (r *KBRepo) ListDocs(ctx context.Context, kbID int64, offset, limit int) ([]model.Document, int64, error) {
 	var (
 		list  []model.Document
@@ -125,36 +118,36 @@ func (r *KBRepo) ListDocs(ctx context.Context, kbID int64, offset, limit int) ([
 	return list, total, err
 }
 
-// DeleteDoc 删除文档记录。
+// DeleteDoc deletes the document row; external index cleanup remains the service/engine's responsibility.
 func (r *KBRepo) DeleteDoc(ctx context.Context, id int64) error {
 	return r.db.WithContext(ctx).Delete(&model.Document{}, id).Error
 }
 
-// ---- Chunk（实现 engine.ChunkRepo）----
-
-// BatchCreate 批量写入分块（单事务，id 回填后供向量化使用）。
+// BatchCreate inserts chunks in batches of 200 within one database transaction.
+// Generated IDs are written into the supplied slice for vector indexing. A batch
+// failure rolls back all chunk inserts from this call.
 func (r *KBRepo) BatchCreate(ctx context.Context, chunks []model.DocumentChunk) error {
 	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		return tx.CreateInBatches(chunks, 200).Error
 	})
 }
 
-// ListByDoc 文档全部分块。
+// ListByDoc returns all document chunks in sequence order for ingestion cleanup and inspection.
 func (r *KBRepo) ListByDoc(ctx context.Context, docID int64) ([]model.DocumentChunk, error) {
 	var list []model.DocumentChunk
 	err := r.db.WithContext(ctx).Where("document_id = ?", docID).Order("seq ASC").Find(&list).Error
 	return list, err
 }
 
-// DeleteByDoc 删除文档全部分块。
+// DeleteByDoc removes the stored chunks for a document without touching its external vectors.
 func (r *KBRepo) DeleteByDoc(ctx context.Context, docID int64) error {
 	return r.db.WithContext(ctx).Delete(&model.DocumentChunk{}, "document_id = ?", docID).Error
 }
 
-// keywordCandidateLimit 关键词候选池上限（先粗召回，Go 侧精排）。
+// keywordCandidateLimit bounds the SQL candidate set scored in memory by keyword retrieval.
 const keywordCandidateLimit = 500
 
-// ListByIDs 按 ID 批量回查分块（稠密检索命中后回表取 content 用）。
+// ListByIDs loads enabled chunks after dense retrieval; an empty input avoids an unnecessary IN query.
 func (r *KBRepo) ListByIDs(ctx context.Context, ids []int64) ([]model.DocumentChunk, error) {
 	if len(ids) == 0 {
 		return nil, nil
@@ -164,17 +157,15 @@ func (r *KBRepo) ListByIDs(ctx context.Context, ids []int64) ([]model.DocumentCh
 	return list, err
 }
 
-// KeywordSearch 关键词检索（BM25-lite，教学自研版）。
-//
-// 两步走（教学点：全文检索的本质 = 召回 + 打分）：
-//  1. SQL 粗召回：任一分词 ILIKE 命中的候选（走 pg_trgm GIN 索引可加速，见迁移）；
-//  2. Go 精排：TF-IDF 打分 —— tf(词频) × idf(逆文档频率，基于候选池近似)。
+// KeywordSearch uses OR-combined ILIKE terms to select a bounded candidate set.
+// It scores candidates with term frequency and an approximate inverse frequency
+// computed from that same pool, then returns the highest-scoring chunks with
+// source filenames. This is not a full-corpus BM25 index.
 func (r *KBRepo) KeywordSearch(ctx context.Context, kbID int64, terms []string, limit int) ([]engine.ScoredChunk, error) {
 	if len(terms) == 0 {
 		return nil, nil
 	}
 
-	// ① 粗召回：OR 条件任一命中
 	var candidates []model.DocumentChunk
 	q := r.db.WithContext(ctx).Where("kb_id = ? AND status = 1", kbID)
 	conds := make([]string, 0, len(terms))
@@ -191,7 +182,6 @@ func (r *KBRepo) KeywordSearch(ctx context.Context, kbID int64, terms []string, 
 		return nil, nil
 	}
 
-	// ② 文档名联查（引用展示需要文件名）
 	docIDs := make([]int64, 0, len(candidates))
 	seen := map[int64]bool{}
 	for _, c := range candidates {
@@ -209,7 +199,6 @@ func (r *KBRepo) KeywordSearch(ctx context.Context, kbID int64, terms []string, 
 		docNames[d.ID] = d.Filename
 	}
 
-	// ③ TF-IDF 打分（候选池近似 idf）
 	n := float64(len(candidates))
 	type hit struct {
 		chunk model.DocumentChunk
@@ -224,7 +213,7 @@ func (r *KBRepo) KeywordSearch(ctx context.Context, kbID int64, terms []string, 
 			if tf == 0 {
 				continue
 			}
-			// idf：候选池中包含该词的文档占比的倒数（平滑）
+			// Estimate smoothed inverse document frequency from the candidate pool.
 			df := 0
 			for _, c2 := range candidates {
 				if strings.Contains(strings.ToLower(c2.Content), strings.ToLower(t)) {
@@ -250,7 +239,7 @@ func (r *KBRepo) KeywordSearch(ctx context.Context, kbID int64, terms []string, 
 	return out, nil
 }
 
-// ListChunks 分块列表（检索测试台展示）。
+// ListChunks pages one document's chunks in sequence order and returns its total count.
 func (r *KBRepo) ListChunks(ctx context.Context, docID int64, offset, limit int) ([]model.DocumentChunk, int64, error) {
 	var (
 		list  []model.DocumentChunk

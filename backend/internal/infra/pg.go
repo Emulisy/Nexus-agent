@@ -1,4 +1,6 @@
-// Package infra 基础设施连接初始化：PostgreSQL。
+// Package infra constructs external service clients for the API and worker.
+// Startup owns these clients and their configuration; schema migration remains a
+// separate command rather than an implicit side effect of opening a SQL connection.
 package infra
 
 import (
@@ -11,10 +13,12 @@ import (
 	gormlogger "gorm.io/gorm/logger"
 
 	"github.com/chengpeng-cp/nexus-agent/internal/config"
-	"github.com/chengpeng-cp/nexus-agent/internal/observability/logger"
+	"github.com/chengpeng-cp/nexus-agent/internal/logging"
 )
 
-// NewPG 初始化 GORM PostgreSQL 连接。
+// NewPG opens GORM with the configured PostgreSQL DSN, applies SQL pool limits,
+// and checks connectivity with a five-second ping. Slow queries use the shared
+// structured logger; record-not-found errors are excluded from routine GORM logs.
 func NewPG(ctx context.Context, cfg *config.PG) (*gorm.DB, error) {
 	logLevel := gormlogger.Warn
 	if cfg.DSN == "" {
@@ -22,7 +26,6 @@ func NewPG(ctx context.Context, cfg *config.PG) (*gorm.DB, error) {
 	}
 
 	db, err := gorm.Open(postgres.Open(cfg.DSN), &gorm.Config{
-		// 全局禁用外键迁移（表结构由 migrations 管理，GORM 只做读写）
 		DisableForeignKeyConstraintWhenMigrating: true,
 		Logger: gormlogger.New(
 			gormWriter{},
@@ -45,20 +48,20 @@ func NewPG(ctx context.Context, cfg *config.PG) (*gorm.DB, error) {
 	sqlDB.SetMaxIdleConns(cfg.MaxIdleConns)
 	sqlDB.SetConnMaxLifetime(cfg.ConnMaxLifetime)
 
-	// 启动时探活
 	pingCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	if err := sqlDB.PingContext(pingCtx); err != nil {
 		return nil, fmt.Errorf("ping postgres: %w", err)
 	}
 
-	logger.L().Info("postgres connected", logger.TraceID("infra"))
+	logging.LogInfo("postgres connected")
 	return db, nil
 }
 
-// gormWriter 把 GORM 日志转发到 zap，保持日志出口统一。
+// gormWriter adapts the GORM printf logger to the local console logger.
 type gormWriter struct{}
 
+// Printf retains the query diagnostic format and marks the message as GORM output.
 func (gormWriter) Printf(format string, args ...any) {
-	logger.L().Sugar().Infof("[gorm] "+format, args...)
+	logging.LogWarn(fmt.Sprintf("[gorm] "+format, args...))
 }

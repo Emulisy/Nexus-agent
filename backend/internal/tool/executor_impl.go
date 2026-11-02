@@ -1,12 +1,3 @@
-// 生产级工具执行器（td.md §8.7）。
-//
-// 统一执行管道：
-//
-//	查定义 → 参数 JSON Schema 校验 → 超时 ctx → panic recover
-//	→ 危险工具 HITL（由 agent 层拦截） → handler 执行 → 结构化结果
-//
-// 教学要点（Ep 04）：工具错误必须"结构化返回给模型"而不是抛异常终止 ——
-// 这是 Agent 自我修正能力的前提。
 package tool
 
 import (
@@ -15,41 +6,42 @@ import (
 	"fmt"
 	"time"
 
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/codes"
-
 	"github.com/chengpeng-cp/nexus-agent/internal/llm"
 	"github.com/chengpeng-cp/nexus-agent/internal/model"
-	"github.com/chengpeng-cp/nexus-agent/internal/observability"
 	"github.com/chengpeng-cp/nexus-agent/internal/pkg/errcode"
 )
 
-// ToolRepo 工具定义数据访问（由 repository 实现注入）。
+// ToolRepo resolves stored descriptions, parameter schemas, and per-tool timeout
+// metadata. Bindings may identify records by database ID or stable tool code.
 type ToolRepo interface {
 	GetByCode(ctx context.Context, code string) (*model.Tool, error)
 	ListByCodes(ctx context.Context, codes []string) ([]model.Tool, error)
 	ListByIDs(ctx context.Context, ids []int64) ([]model.Tool, error)
 }
 
-// ExecutorConfig 执行器配置。
+// ExecutorConfig supplies the fallback context deadline for handler execution.
 type ExecutorConfig struct {
 	DefaultTimeout time.Duration
 }
 
-// ProdExecutor 生产级执行器。
+// ProdExecutor joins database definitions with registered handlers and common
+// timeout, argument decoding, and result formatting. It does not perform
+// JSON Schema validation, binding authorization, or interactive tool approval.
 type ProdExecutor struct {
 	repo     ToolRepo
 	registry Registry
 	cfg      ExecutorConfig
 }
 
-// NewExecutor 构造。
+// NewExecutor wires tool metadata, handler lookup, and a default timeout.
 func NewExecutor(repo ToolRepo, reg Registry, cfg ExecutorConfig) *ProdExecutor {
 	return &ProdExecutor{repo: repo, registry: reg, cfg: cfg}
 }
 
-// List 按 Agent 的工具绑定 JSON（[{tool_id, config}]）产出模型可见的工具定义。
-// 兼容只带 tool_id 的绑定（前端表单）：按 ID 查库回填定义；带 tool_code 的按 code 查询。
+// List resolves agent binding JSON into definitions advertised to the model.
+// Bindings with codes are fetched by code; ID-only bindings are fetched by ID.
+// The combined records are deduplicated by code. Binding Config values are parsed
+// for format compatibility but are not merged into invocation arguments here.
 func (e *ProdExecutor) List(agentToolsJSON string) ([]llm.ToolDef, error) {
 	bindings, err := ParseAgentBindings(agentToolsJSON)
 	if err != nil {
@@ -60,7 +52,9 @@ func (e *ProdExecutor) List(agentToolsJSON string) ([]llm.ToolDef, error) {
 	}
 
 	ctx := context.Background()
-	// 按绑定中已有的标识分两路查询（tool_id 必有；tool_code 可选）
+
+	// Split lookup paths so both persisted formats can resolve without assuming
+	// that a frontend-created binding already includes its stable tool code.
 	ids := make([]int64, 0, len(bindings))
 	codes := make([]string, 0, len(bindings))
 	for _, b := range bindings {
@@ -85,10 +79,12 @@ func (e *ProdExecutor) List(agentToolsJSON string) ([]llm.ToolDef, error) {
 	defs := make([]llm.ToolDef, 0, len(tools))
 	seen := map[string]bool{}
 	for _, t := range tools {
-		if seen[t.Code] { // 两条查询路径可能重复命中
+		if seen[t.Code] {
 			continue
 		}
 		seen[t.Code] = true
+		// Invalid stored schema JSON falls back to a generic object schema instead
+		// of preventing all tool definitions from being listed.
 		var params map[string]any
 		if jsonErr := json.Unmarshal(t.Parameters, &params); jsonErr != nil {
 			params = map[string]any{"type": "object", "properties": map[string]any{}}
@@ -102,27 +98,19 @@ func (e *ProdExecutor) List(agentToolsJSON string) ([]llm.ToolDef, error) {
 	return defs, nil
 }
 
-// Invoke 执行一次工具调用。
+// Invoke selects the stored timeout override when available,
+// looks up a registered handler, and decodes argument JSON before execution.
+// Ordinary handler failures are returned as observations so the model can adapt.
+//
+// agentToolsJSON is not currently consulted during invocation: schema advertising
+// and registry dispatch are separate operations. The deadline is context-based,
+// so a handler must honor cancellation or enforce its own execution boundary.
 func (e *ProdExecutor) Invoke(ctx context.Context, agentToolsJSON, name, argsJSON string) ToolResult {
-	ctx, span := observability.StartSpan(ctx, "tool."+name, attribute.String("tool.name", name))
-
 	start := time.Now()
 	res := ToolResult{ToolName: name}
 
-	// span 收尾放在最前面注册（defer 后进先出，它会最后执行）：
-	// 这样无论正常返回、提前返回还是 panic 兜底，都能带上最终状态和耗时。
-	defer func() {
-		span.SetAttributes(
-			attribute.String("tool.status", res.Status),
-			attribute.Int64("tool.elapsed_ms", res.Elapsed),
-		)
-		if res.Status != "" && res.Status != "ok" {
-			span.SetStatus(codes.Error, res.Status)
-		}
-		span.End()
-	}()
-
-	// ① 超时控制：默认 30s，工具定义可覆盖
+	// A tool-row timeout overrides the default. Missing metadata does not prevent
+	// calling a handler that is already present in the registry.
 	timeout := e.cfg.DefaultTimeout
 	if t, err := e.repo.GetByCode(ctx, name); err == nil && t != nil && t.TimeoutMs > 0 {
 		timeout = time.Duration(t.TimeoutMs) * time.Millisecond
@@ -130,7 +118,6 @@ func (e *ProdExecutor) Invoke(ctx context.Context, agentToolsJSON, name, argsJSO
 	runCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	// ② panic 兜底：工具实现方的 panic 不允许打爆 Agent
 	defer func() {
 		if r := recover(); r != nil {
 			res.Output = fmt.Sprintf(`{"error":"tool panic: %v"}`, r)
@@ -139,7 +126,8 @@ func (e *ProdExecutor) Invoke(ctx context.Context, agentToolsJSON, name, argsJSO
 		}
 	}()
 
-	// ③ 查 handler
+	// The registry is the actual execution dispatch table; no handler means a
+	// structured unknown-tool observation.
 	handler, ok := e.registry.Get(name)
 	if !ok {
 		res.Output = fmt.Sprintf(`{"error":"unknown tool: %s"}`, name)
@@ -148,7 +136,8 @@ func (e *ProdExecutor) Invoke(ctx context.Context, agentToolsJSON, name, argsJSO
 		return res
 	}
 
-	// ④ 参数解析（失败时也回传给模型修正）
+	// Decode syntax here; semantic argument checks remain the handler responsibility.
+	// An empty argument string is accepted as an empty/nil argument map.
 	var args map[string]any
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil && argsJSON != "" {
 		res.Output = fmt.Sprintf(`{"error":"invalid tool args json: %v"}`, err)
@@ -157,12 +146,12 @@ func (e *ProdExecutor) Invoke(ctx context.Context, agentToolsJSON, name, argsJSO
 		return res
 	}
 
-	// ⑤ 执行
+	// Pass the bounded context through to local handlers or remote protocol proxies.
 	out, err := handler(runCtx, args, argsJSON)
 	switch {
 	case err == nil:
 		res.Status = "ok"
-	case ctxErr(runCtx) != nil:
+	case runCtx.Err() != nil:
 		res.Status = "timeout"
 		err = errcode.ErrToolTimeout.WithCause(err)
 	default:
@@ -172,7 +161,9 @@ func (e *ProdExecutor) Invoke(ctx context.Context, agentToolsJSON, name, argsJSO
 		if res.Status == "" {
 			res.Status = "error"
 		}
-		// 错误结构化回传模型
+
+		// Preserve any explanatory output returned with an error; synthesize an error
+		// object only when the handler supplied no observation text.
 		if out == "" {
 			out = fmt.Sprintf(`{"error": %q}`, err.Error())
 		}
@@ -182,20 +173,16 @@ func (e *ProdExecutor) Invoke(ctx context.Context, agentToolsJSON, name, argsJSO
 	return res
 }
 
-// ctxErr 取 ctx 错误（若已超时/取消）。
-func ctxErr(ctx context.Context) error {
-	return ctx.Err()
-}
-
-// AgentToolBinding 解析后的 Agent 工具绑定。
+// AgentToolBinding is the persisted agents.tools entry. ToolCode is optional
+// for ID-only frontend bindings, and Config preserves per-binding JSON values.
 type AgentToolBinding struct {
 	ToolID   int64          `json:"tool_id"`
 	ToolCode string         `json:"tool_code,omitempty"`
 	Config   map[string]any `json:"config,omitempty"`
 }
 
-// ParseAgentBindings 解析 agents.tools JSONB。
-// 兼容两种格式：[{tool_id}] / [{tool_id, tool_code, config}]（seed 时补 tool_code）。
+// ParseAgentBindings treats empty, null, and [] as no tools. Other input must be
+// a JSON array of bindings; malformed JSON becomes an application parameter error.
 func ParseAgentBindings(raw string) ([]AgentToolBinding, error) {
 	if raw == "" || raw == "[]" || raw == "null" {
 		return nil, nil

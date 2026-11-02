@@ -1,7 +1,3 @@
-// 熔断器：滑动窗口错误率统计（td.md §8.1 故障转移依据）。
-//
-// 原理：维护最近 N 次调用结果环形缓冲，错误率超阈值 → 断路器打开（拒绝请求，
-// 直接走 fallback 模型），冷却期后半开试探恢复。状态同步写入 Redis 供多实例共享。
 package llm
 
 import (
@@ -9,19 +5,24 @@ import (
 	"time"
 )
 
-// CircuitBreaker 供应商级熔断器。
+// CircuitBreaker keeps a fixed-size circular window of final call outcomes for
+// one provider. State is local to this process; an open circuit rejects requests
+// until its cooldown expires, then resumes collecting a fresh window.
 type CircuitBreaker struct {
-    mu        sync.Mutex
-    window    []bool   // true=成功 false=失败（环形）
-    filled    int      // 已写入的样本数（窗口填满前不评估，避免空样本误判为失败）
-    pos       int
-    size      int
-    errRate   float64   // 触发阈值
-    openDur   time.Duration
-    openUntil time.Time // 熔断到期时间（零值=关闭）
+	mu     sync.Mutex
+	window []bool
+	// filled prevents zero-value slots from being treated as observed failures.
+	filled  int
+	pos     int
+	size    int
+	errRate float64
+	openDur time.Duration
+	// openUntil is the earliest time a request may pass; zero means initially closed.
+	openUntil time.Time
 }
 
-// NewCircuitBreaker 构造。windowSize 窗口大小，errRate 错误率阈值，openDuration 熔断时长。
+// NewCircuitBreaker configures the sample window, failure-rate threshold, and
+// cooldown duration. Non-positive window sizes use twenty outcomes.
 func NewCircuitBreaker(windowSize int, errRate float64, openDuration time.Duration) *CircuitBreaker {
 	if windowSize <= 0 {
 		windowSize = 20
@@ -35,21 +36,24 @@ func NewCircuitBreaker(windowSize int, errRate float64, openDuration time.Durati
 	}
 }
 
-// Allow 是否放行请求。返回 false 表示熔断中（应走 fallback）。
+// Allow checks only the cooldown deadline. It does not reserve a single probe
+// request or perform a distributed half-open transition.
 func (c *CircuitBreaker) Allow() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return time.Now().After(c.openUntil)
 }
 
-// Record 记录一次调用结果；达到阈值后打开熔断。
+// Record replaces the oldest sample and evaluates the error rate only after a
+// full window has been collected. Opening resets the samples so a later recovery
+// period is evaluated against new outcomes rather than stale failures.
 func (c *CircuitBreaker) Record(success bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.window[c.pos] = success
 	c.pos = (c.pos + 1) % c.size
 	if c.filled < c.size {
-		c.filled++ // 预热期：样本不足不评估（窗口零值 false 不代表真实失败）
+		c.filled++
 	}
 
 	var fails int
@@ -60,7 +64,9 @@ func (c *CircuitBreaker) Record(success bool) {
 	}
 	if c.filled == c.size && float64(fails)/float64(c.size) >= c.errRate {
 		c.openUntil = time.Now().Add(c.openDur)
-		// 熔断后重置窗口，冷却结束时半开试探
+
+		// Reset the observed window after opening; filled remains the authority for
+		// whether enough new samples exist to evaluate another failure rate.
 		for i := range c.window {
 			c.window[i] = true
 		}

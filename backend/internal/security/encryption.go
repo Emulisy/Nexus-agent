@@ -1,5 +1,6 @@
-// 敏感配置加密：AES-256-GCM。
-// 供应商 API Key / 工具认证配置落库前加密，主密钥来自 NX_SECRET_KEY。
+// Credential encryption uses AES-256-GCM with a key derived from the configured master secret.
+// Stored values contain the random nonce followed by authenticated ciphertext,
+// encoded as base64. Empty credentials remain empty to represent no configured key.
 package security
 
 import (
@@ -12,12 +13,14 @@ import (
 	"io"
 )
 
-// Encryptor AES-GCM 加解密器。
+// Encryptor holds the authenticated cipher used for provider credential storage and retrieval.
 type Encryptor struct {
 	gcm cipher.AEAD
 }
 
-// NewEncryptor 用主密钥派生 AES 密钥（sha256）。
+// NewEncryptor rejects an empty master secret and derives a 32-byte key with SHA-256.
+// The derived key initializes AES-GCM; changing the configured master secret
+// makes previously stored ciphertext unreadable until credentials are replaced.
 func NewEncryptor(masterKey string) (*Encryptor, error) {
 	if masterKey == "" {
 		return nil, fmt.Errorf("secret_key is empty")
@@ -34,7 +37,9 @@ func NewEncryptor(masterKey string) (*Encryptor, error) {
 	return &Encryptor{gcm: gcm}, nil
 }
 
-// Encrypt 加密 → base64(nonce+ciphertext)。
+// Encrypt generates a fresh nonce and returns base64(nonce || ciphertext || tag).
+// The nonce is included for later decryption; the master key is not stored in
+// the result. Randomness/cipher errors are returned without embedding plaintext.
 func (e *Encryptor) Encrypt(plain string) (string, error) {
 	if plain == "" {
 		return "", nil
@@ -47,7 +52,9 @@ func (e *Encryptor) Encrypt(plain string) (string, error) {
 	return base64.StdEncoding.EncodeToString(ct), nil
 }
 
-// Decrypt 解密 base64(nonce+ciphertext)。
+// Decrypt validates base64 and nonce length, then authenticates and decrypts with GCM.
+// Wrong keys, truncated data, and modified ciphertext fail authentication instead
+// of returning partial plaintext. Empty input is a valid empty credential.
 func (e *Encryptor) Decrypt(encoded string) (string, error) {
 	if encoded == "" {
 		return "", nil

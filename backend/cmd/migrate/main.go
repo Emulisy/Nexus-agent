@@ -1,12 +1,7 @@
-// 数据库迁移工具：执行 migrations/*.sql 并种子管理员账号。
-//
-// 为什么独立成 cmd：服务进程保持无状态启动（main.go 不做 DDL），
-// 迁移由 `make migrate`（本命令）显式执行 —— 生产可用 CI 卡点，教学可手动执行。
-//
-// 用法：
-//
-//	go run ./cmd/migrate          # 执行全部 up 迁移 + 种子
-//	go run ./cmd/migrate -down 1  # 回滚最近 1 个版本（危险，教学演示用）
+// Command migrate applies versioned SQL migrations and initializes admin credentials.
+// Schema changes are explicit deployment operations rather than part of API
+// startup. Upgrades tolerate an already-current schema; a positive -down value
+// rolls back that many versions and skips account initialization.
 package main
 
 import (
@@ -18,16 +13,17 @@ import (
 	"os"
 
 	"github.com/golang-migrate/migrate/v4"
-	_ "github.com/golang-migrate/migrate/v4/database/postgres" // lib/pq 驱动 + schema_migrations 表
-	_ "github.com/golang-migrate/migrate/v4/source/file"       // file:// 读取 migrations/ 目录
+	_ "github.com/golang-migrate/migrate/v4/database/postgres"
+	_ "github.com/golang-migrate/migrate/v4/source/file"
 	"golang.org/x/crypto/bcrypt"
 
 	"github.com/chengpeng-cp/nexus-agent/internal/config"
 	"github.com/chengpeng-cp/nexus-agent/internal/infra"
 )
 
+// main parses the rollback count and reports migration failures with a nonzero exit status.
 func main() {
-	down := flag.Int("down", 0, "回滚 N 个版本（默认 0 = 只做升级）")
+	down := flag.Int("down", 0, "Roll back N versions (default 0 applies upgrades only)")
 	flag.Parse()
 
 	if err := run(*down); err != nil {
@@ -36,15 +32,15 @@ func main() {
 	}
 }
 
+// run loads the shared PostgreSQL configuration and opens the file migration source.
+// Successful upgrades, including a no-change result, are followed by admin
+// initialization. The migrator closes its source and database handles on return.
 func run(down int) error {
-	// ① 复用统一配置加载（PG DSN 来自 config.yaml / NX_ 环境变量）
 	cfg, err := config.Load("")
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
 
-	// ② 升级：file source 顺序执行 migrations/NNN_xxx.up.sql，
-	//    已应用的记录在 schema_migrations 表（golang-migrate 自动维护，幂等）
 	m, err := migrate.New("file://migrations", cfg.PG.DSN)
 	if err != nil {
 		return fmt.Errorf("new migrator: %w", err)
@@ -63,18 +59,18 @@ func run(down int) error {
 	}
 	fmt.Println("migrations applied")
 
-	// ③ 种子管理员：users 表为空才插入（幂等，密码哈希在代码层生成，
-	//    与 002_seed.up.sql 头部注释的设计一致）
 	if err := seedAdmin(cfg.PG.DSN); err != nil {
 		return fmt.Errorf("seed admin: %w", err)
 	}
 	return nil
 }
 
-// seedAdmin inserts the initial admin only when users is empty. It also rotates
-// the legacy admin/admin123 credential on upgraded installations.
+// seedAdmin inserts an administrator only when the users table is empty.
+// For an existing installation, it rotates the legacy admin/admin123 password
+// while leaving other accounts unchanged. Password hashing occurs here rather
+// than in SQL, using a supplied or cryptographically generated bootstrap secret.
 func seedAdmin(dsn string) error {
-	db, err := infra.NewPG(disabledCtx(), &config.PG{DSN: dsn, MaxOpenConns: 2, MaxIdleConns: 1})
+	db, err := infra.NewPG(context.Background(), &config.PG{DSN: dsn, MaxOpenConns: 2, MaxIdleConns: 1})
 	if err != nil {
 		return err
 	}
@@ -85,7 +81,7 @@ func seedAdmin(dsn string) error {
 	defer sqlDB.Close()
 
 	var userCount int64
-	if err := db.WithContext(disabledCtx()).Table("users").Count(&userCount).Error; err != nil {
+	if err := db.WithContext(context.Background()).Table("users").Count(&userCount).Error; err != nil {
 		return err
 	}
 	if userCount > 0 {
@@ -93,7 +89,7 @@ func seedAdmin(dsn string) error {
 			ID           int64
 			PasswordHash string `gorm:"column:password_hash"`
 		}
-		if err := db.WithContext(disabledCtx()).Table("users").Select("id, password_hash").Where("username = ?", "admin").Take(&legacyAdmin).Error; err != nil {
+		if err := db.WithContext(context.Background()).Table("users").Select("id, password_hash").Where("username = ?", "admin").Take(&legacyAdmin).Error; err != nil {
 			fmt.Println("users table not empty, skip seed")
 			return nil
 		}
@@ -110,7 +106,7 @@ func seedAdmin(dsn string) error {
 		if err != nil {
 			return err
 		}
-		res := db.WithContext(disabledCtx()).Exec("UPDATE users SET password_hash = ?, updated_at = NOW() WHERE id = ?", string(hash), legacyAdmin.ID)
+		res := db.WithContext(context.Background()).Exec("UPDATE users SET password_hash = ?, updated_at = NOW() WHERE id = ?", string(hash), legacyAdmin.ID)
 		if res.Error != nil {
 			return res.Error
 		}
@@ -129,8 +125,8 @@ func seedAdmin(dsn string) error {
 	if err != nil {
 		return err
 	}
-	// 唯一条记录插入：存在任何用户则跳过（与种子 SQL 的幂等约定一致）
-	res := db.WithContext(disabledCtx()).Exec(`
+	// Insert only while the users table is empty.
+	res := db.WithContext(context.Background()).Exec(`
 		INSERT INTO users (username, email, password_hash, role, status)
 		SELECT 'admin', 'admin@nexus.local', ?, 'admin', 1
 		WHERE NOT EXISTS (SELECT 1 FROM users)`, string(hash))
@@ -145,6 +141,9 @@ func seedAdmin(dsn string) error {
 	return nil
 }
 
+// bootstrapPassword reads NX_SEED_ADMIN_PASSWORD or generates 24 random bytes
+// encoded as URL-safe base64. Both paths enforce a minimum of 16 characters;
+// the generated flag tells the caller whether the password must be printed.
 func bootstrapPassword() (password string, generated bool, err error) {
 	password = os.Getenv("NX_SEED_ADMIN_PASSWORD")
 	generated = password == ""
@@ -161,15 +160,13 @@ func bootstrapPassword() (password string, generated bool, err error) {
 	return password, generated, nil
 }
 
+// printBootstrapCredential prints generated credentials once for the operator.
+// An explicitly configured password is never echoed; the message points back to
+// the environment variable used to supply it.
 func printBootstrapCredential(password string, generated bool, action string) {
 	if generated {
-		fmt.Printf("%s: admin / %s (请立即保存并在首次登录后修改密码)\n", action, password)
+		fmt.Printf("%s: admin / %s (save this password now and change it after your first login)\n", action, password)
 	} else {
-		fmt.Printf("%s: admin (使用 NX_SEED_ADMIN_PASSWORD 设置的密码登录)\n", action)
+		fmt.Printf("%s: admin (sign in with the password set by NX_SEED_ADMIN_PASSWORD)\n", action)
 	}
-}
-
-// disabledCtx 迁移场景不需要可取消上下文，给一个空实现保持 infra.NewPG 签名。
-func disabledCtx() (ctx context.Context) {
-	return context.Background()
 }

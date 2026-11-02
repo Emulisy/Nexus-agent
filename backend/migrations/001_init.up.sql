@@ -1,7 +1,10 @@
--- NexusAgent 初始表结构（对齐 td.md §5.2）
--- 规范：主键 BIGSERIAL 或 UUID；时间 TIMESTAMPTZ；灵活配置 JSONB
+-- Initial relational schema. Timestamps use TIMESTAMPTZ and extensible payloads
+-- use JSONB so the service can persist structured configuration and event data.
+-- This migration is historical: tables retained here do not imply that every
+-- corresponding feature has an active API or execution path in the application.
 
--- ===== 用户 =====
+-- Users: authentication identities and the admin/user role used by API guards.
+-- Store password hashes only; username and email are independently unique.
 CREATE TABLE users (
     id            BIGSERIAL PRIMARY KEY,
     username      VARCHAR(64)  NOT NULL UNIQUE,
@@ -14,12 +17,13 @@ CREATE TABLE users (
     updated_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
 
--- ===== 会话 =====
+-- Sessions group message history under a user-owned UUID. Agent selection is
+-- optional; counters and last_msg_at support the paginated recent-session list.
 CREATE TABLE sessions (
     id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id       BIGINT      NOT NULL REFERENCES users(id),
     agent_id      BIGINT,
-    title         VARCHAR(256) NOT NULL DEFAULT '新对话',
+    title         VARCHAR(256) NOT NULL DEFAULT 'New chat',
     status        VARCHAR(20) NOT NULL DEFAULT 'active',
     pinned        BOOLEAN     NOT NULL DEFAULT FALSE,
     message_count INT         NOT NULL DEFAULT 0,
@@ -31,7 +35,10 @@ CREATE TABLE sessions (
 );
 CREATE INDEX idx_sessions_user ON sessions(user_id, last_msg_at DESC);
 
--- ===== 消息 =====
+-- Messages retain user input and completed assistant output. Structured tool
+-- calls, retrieval references, and trace metadata accompany the text when present.
+-- Token and timing columns are accounting fields; their presence does not imply
+-- that every provider or execution path populates every measurement.
 CREATE TABLE messages (
     id                BIGSERIAL PRIMARY KEY,
     session_id        UUID        NOT NULL REFERENCES sessions(id),
@@ -47,13 +54,13 @@ CREATE TABLE messages (
     first_token_ms    INT         NOT NULL DEFAULT 0,
     latency_ms        INT         NOT NULL DEFAULT 0,
     status            SMALLINT    NOT NULL DEFAULT 1,
-    trace_id          VARCHAR(64) NOT NULL DEFAULT '',
     metadata          JSONB       NOT NULL DEFAULT '{}',
     created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE INDEX idx_messages_session ON messages(session_id, created_at);
 
--- ===== 模型供应商 =====
+-- Model providers define OpenAI-compatible endpoints and encrypted API credentials.
+-- Individual model choices live in model_configs and refer back to this record.
 CREATE TABLE model_providers (
     id         BIGSERIAL PRIMARY KEY,
     code       VARCHAR(32)  NOT NULL UNIQUE,
@@ -65,7 +72,9 @@ CREATE TABLE model_providers (
     updated_at TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
 
--- ===== 模型配置 =====
+-- Model configurations separate provider model identifiers from application aliases.
+-- Type, capability flags, status, and priority are available to model resolution;
+-- pricing fields are stored metadata, independent of runtime cost calculation.
 CREATE TABLE model_configs (
     id             BIGSERIAL PRIMARY KEY,
     provider_id    BIGINT      NOT NULL REFERENCES model_providers(id),
@@ -85,7 +94,9 @@ CREATE TABLE model_configs (
 );
 CREATE INDEX idx_model_configs_type ON model_configs(type, priority);
 
--- ===== Agent 配置 =====
+-- Agents bind model settings, persona, tool declarations, memory options, and KB IDs.
+-- The JSONB lists refer to configured resources without relational join tables.
+-- User ownership is added separately by migration 003.
 CREATE TABLE agents (
     id                BIGSERIAL PRIMARY KEY,
     name              VARCHAR(128) NOT NULL,
@@ -109,10 +120,13 @@ CREATE TABLE agents (
     created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+-- Add the optional session-to-agent reference after both tables exist.
 ALTER TABLE sessions ADD CONSTRAINT fk_sessions_agent
     FOREIGN KEY (agent_id) REFERENCES agents(id);
 
--- ===== 工具 =====
+-- Tool definitions supply the model-visible name, description, and JSON Schema.
+-- Handler metadata selects the implementation configured by the service layer;
+-- is_dangerous records a classification rather than implementing an approval gate.
 CREATE TABLE tools (
     id            BIGSERIAL PRIMARY KEY,
     code          VARCHAR(64)  NOT NULL UNIQUE,
@@ -132,7 +146,8 @@ CREATE TABLE tools (
     updated_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
 
--- ===== MCP 服务 =====
+-- MCP connection records retain transport settings, connection health, and cached
+-- tool descriptions. Secret-bearing environment/header fields are structured JSON.
 CREATE TABLE mcp_servers (
     id             BIGSERIAL PRIMARY KEY,
     name           VARCHAR(64)  NOT NULL,
@@ -148,10 +163,12 @@ CREATE TABLE mcp_servers (
     created_at     TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
     updated_at     TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
+-- MCP-backed definitions can refer to their source server once it has been created.
 ALTER TABLE tools ADD CONSTRAINT fk_tools_mcp_server
     FOREIGN KEY (mcp_server_id) REFERENCES mcp_servers(id);
 
--- ===== A2A 远程 Agent 注册 =====
+-- Remote A2A agents retain discovery-card data and endpoint health separately
+-- from local Agent definitions. Calls use the registered remote base URL.
 CREATE TABLE a2a_agents (
     id             BIGSERIAL PRIMARY KEY,
     name           VARCHAR(128) NOT NULL,
@@ -163,7 +180,8 @@ CREATE TABLE a2a_agents (
     updated_at     TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
 
--- ===== 知识库 =====
+-- Knowledge bases are owned by users and map document collections to Milvus names.
+-- Per-KB chunk settings and embedding metadata are retained with the collection.
 CREATE TABLE knowledge_bases (
     id                 BIGSERIAL PRIMARY KEY,
     name               VARCHAR(128) NOT NULL,
@@ -180,7 +198,9 @@ CREATE TABLE knowledge_bases (
     updated_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- ===== 文档 =====
+-- Documents track original uploads by MinIO object key and ingestion status.
+-- The worker updates parse/index progress, counts, and diagnostic errors;
+-- the source bytes remain in object storage rather than this table.
 CREATE TABLE documents (
     id           BIGSERIAL PRIMARY KEY,
     kb_id        BIGINT       NOT NULL REFERENCES knowledge_bases(id),
@@ -200,7 +220,8 @@ CREATE TABLE documents (
 );
 CREATE INDEX idx_documents_kb ON documents(kb_id, status);
 
--- ===== 文档分块 =====
+-- Document chunks store searchable text and page metadata. Generated SQL IDs are
+-- also used as vector primary keys so retrieval hits can be resolved back to text.
 CREATE TABLE document_chunks (
     id          BIGSERIAL PRIMARY KEY,
     kb_id       BIGINT      NOT NULL,
@@ -215,7 +236,8 @@ CREATE TABLE document_chunks (
 );
 CREATE INDEX idx_chunks_doc ON document_chunks(document_id, seq);
 
--- ===== 长期记忆 =====
+-- Long-term memory stores user/Agent-scoped facts and retrieval metadata in SQL.
+-- Embeddings live in Milvus; status supports hiding a fact without deleting it.
 CREATE TABLE memories (
     id          BIGSERIAL PRIMARY KEY,
     user_id     BIGINT      NOT NULL REFERENCES users(id),
@@ -232,21 +254,8 @@ CREATE TABLE memories (
 );
 CREATE INDEX idx_memories_user ON memories(user_id, agent_id, status);
 
--- ===== Prompt 模板 =====
-CREATE TABLE prompts (
-    id         BIGSERIAL PRIMARY KEY,
-    agent_id   BIGINT REFERENCES agents(id),
-    name       VARCHAR(128) NOT NULL,
-    content    TEXT         NOT NULL,
-    variables  JSONB        NOT NULL DEFAULT '[]',
-    version    INT          NOT NULL DEFAULT 1,
-    is_active  BOOLEAN      NOT NULL DEFAULT FALSE,
-    remark     VARCHAR(255) NOT NULL DEFAULT '',
-    created_at TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ  NOT NULL DEFAULT NOW()
-);
-
--- ===== 工作流 =====
+-- Workflow definitions keep the editable YAML DSL and its version under a creator.
+-- Definition activation and record status are separate from execution status.
 CREATE TABLE workflows (
     id         BIGSERIAL PRIMARY KEY,
     name       VARCHAR(128) NOT NULL,
@@ -260,7 +269,8 @@ CREATE TABLE workflows (
     updated_at TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
 
--- ===== 工作流执行 =====
+-- One run captures the workflow input, final output or error, and execution timing.
+-- Node-level snapshots are stored separately so run listings stay lightweight.
 CREATE TABLE workflow_runs (
     id           BIGSERIAL PRIMARY KEY,
     workflow_id  BIGINT      NOT NULL REFERENCES workflows(id),
@@ -269,14 +279,14 @@ CREATE TABLE workflow_runs (
     input        JSONB       NOT NULL DEFAULT '{}',
     output       JSONB,
     error        VARCHAR(512) NOT NULL DEFAULT '',
-    trace_id     VARCHAR(64) NOT NULL DEFAULT '',
     started_at   TIMESTAMPTZ,
     finished_at  TIMESTAMPTZ,
     created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE INDEX idx_workflow_runs_status ON workflow_runs(status);
 
--- ===== 工作流步骤执行 =====
+-- Step snapshots associate a stable DSL node key with its input, output, and state.
+-- Their run_id links them to the parent execution, including paused human steps.
 CREATE TABLE workflow_step_runs (
     id          BIGSERIAL PRIMARY KEY,
     run_id      BIGINT      NOT NULL REFERENCES workflow_runs(id),
@@ -291,101 +301,3 @@ CREATE TABLE workflow_step_runs (
     finished_at TIMESTAMPTZ
 );
 CREATE INDEX idx_step_runs_run ON workflow_step_runs(run_id);
-
--- ===== 评估集 =====
-CREATE TABLE eval_datasets (
-    id          BIGSERIAL PRIMARY KEY,
-    name        VARCHAR(128) NOT NULL,
-    description TEXT,
-    scene       VARCHAR(16) NOT NULL DEFAULT 'agent',
-    case_count  INT         NOT NULL DEFAULT 0,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
--- ===== 评估用例 =====
-CREATE TABLE eval_cases (
-    id                 BIGSERIAL PRIMARY KEY,
-    dataset_id         BIGINT NOT NULL REFERENCES eval_datasets(id),
-    question           TEXT   NOT NULL,
-    expected_answer    TEXT,
-    expected_tools     JSONB  NOT NULL DEFAULT '[]',
-    expected_chunk_ids JSONB  NOT NULL DEFAULT '[]',
-    tags               VARCHAR(255) NOT NULL DEFAULT '',
-    source             VARCHAR(16) NOT NULL DEFAULT 'manual',
-    created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
--- ===== 评估执行 =====
-CREATE TABLE eval_runs (
-    id          BIGSERIAL PRIMARY KEY,
-    dataset_id  BIGINT      NOT NULL REFERENCES eval_datasets(id),
-    agent_id    BIGINT      REFERENCES agents(id),
-    config      JSONB       NOT NULL DEFAULT '{}',
-    status      VARCHAR(16) NOT NULL DEFAULT 'pending',
-    total       INT         NOT NULL DEFAULT 0,
-    passed      INT         NOT NULL DEFAULT 0,
-    metrics     JSONB,
-    started_at  TIMESTAMPTZ,
-    finished_at TIMESTAMPTZ,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
--- ===== 评估结果 =====
-CREATE TABLE eval_results (
-    id            BIGSERIAL PRIMARY KEY,
-    run_id        BIGINT   NOT NULL REFERENCES eval_runs(id),
-    case_id       BIGINT   NOT NULL REFERENCES eval_cases(id),
-    actual_answer TEXT,
-    tool_trace    JSONB,
-    scores        JSONB   NOT NULL DEFAULT '{}',
-    passed        BOOLEAN NOT NULL DEFAULT FALSE,
-    latency_ms    INT     NOT NULL DEFAULT 0,
-    tokens        INT     NOT NULL DEFAULT 0,
-    error         VARCHAR(512) NOT NULL DEFAULT ''
-);
-
--- ===== 反馈（坏例回流）=====
-CREATE TABLE feedbacks (
-    id            BIGSERIAL PRIMARY KEY,
-    message_id    BIGINT      NOT NULL REFERENCES messages(id),
-    session_id    UUID        NOT NULL,
-    user_id       BIGINT      NOT NULL,
-    rating        SMALLINT    NOT NULL,
-    reason        VARCHAR(64) NOT NULL DEFAULT '',
-    comment       VARCHAR(512) NOT NULL DEFAULT '',
-    resolved      BOOLEAN     NOT NULL DEFAULT FALSE,
-    eval_case_id  BIGINT      REFERENCES eval_cases(id),
-    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
--- ===== 用量 =====
-CREATE TABLE usage_logs (
-    id                BIGSERIAL PRIMARY KEY,
-    user_id           BIGINT NOT NULL DEFAULT 0,
-    agent_id          BIGINT NOT NULL DEFAULT 0,
-    session_id        UUID,
-    message_id        BIGINT NOT NULL DEFAULT 0,
-    scene             VARCHAR(16) NOT NULL DEFAULT 'chat',
-    model             VARCHAR(64) NOT NULL,
-    prompt_tokens     INT    NOT NULL DEFAULT 0,
-    completion_tokens INT    NOT NULL DEFAULT 0,
-    cost_amount       NUMERIC(12,6) NOT NULL DEFAULT 0,
-    created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-CREATE INDEX idx_usage_agent_time ON usage_logs(agent_id, created_at);
-CREATE INDEX idx_usage_time ON usage_logs(created_at);
-
--- ===== 沙箱执行记录 =====
-CREATE TABLE sandbox_executions (
-    id           BIGSERIAL PRIMARY KEY,
-    user_id      BIGINT      NOT NULL,
-    tool_call_id VARCHAR(64) NOT NULL,
-    language     VARCHAR(16) NOT NULL,
-    code_hash    CHAR(64)    NOT NULL,
-    exit_code    INT         NOT NULL DEFAULT -1,
-    duration_ms  INT         NOT NULL DEFAULT 0,
-    stdout_head  TEXT,
-    stderr_head  TEXT,
-    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);

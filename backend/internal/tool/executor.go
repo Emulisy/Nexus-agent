@@ -1,5 +1,7 @@
-// 工具系统核心接口定义（agent 域依赖此抽象，避免循环依赖）。
-// 实现见 internal/tool 包。
+// Package tool defines model-facing tool contracts, registers local and remote
+// handlers, and dispatches invocations under execution contexts. Stored tool rows
+// provide descriptions, schemas, and timeout metadata; the registry supplies the
+// actual implementation associated with each code.
 package tool
 
 import (
@@ -8,29 +10,36 @@ import (
 	"github.com/chengpeng-cp/nexus-agent/internal/llm"
 )
 
-// Executor 工具执行器：Agent 运行时的唯一工具入口。
+// Executor exposes tool definitions to a runner and converts handler results to
+// model-facing observations. Listing controls which schemas are advertised; the
+// current production Invoke implementation does not enforce binding membership.
 type Executor interface {
-	// List 当前可用工具定义（已按 Agent 配置过滤并附加默认参数）。
+	// List resolves the agent binding JSON to definitions sent with a model request.
 	List(agentToolsJSON string) ([]llm.ToolDef, error)
-	// Invoke 执行一次工具调用：
-	//   name: 工具 code；argsJSON: 模型给出的 JSON 参数
-	// 返回值是"给模型观察的文本"（错误也结构化返回，让模型自我修正）。
+
+	// Invoke dispatches one tool name with the model argument JSON and a parent
+	// execution context. Failures are ordinarily returned as ToolResult output.
 	Invoke(ctx context.Context, agentToolsJSON, name, argsJSON string) ToolResult
 }
 
-// ToolResult 工具执行结果（含指标，供事件流与 trace 使用）。
+// ToolResult carries the observation returned to the model plus metadata for
+// stream events and decision traces. Output may be successful text or an encoded
+// error; callers must inspect Status rather than infer success from its presence.
 type ToolResult struct {
-	Output   string `json:"output"`    // 给模型的观察文本
-	Elapsed  int64  `json:"elapsed_ms"`
-	Status   string `json:"status"`    // ok/error/timeout
+	Output string `json:"output"`
+	// Elapsed is wall-clock execution time in milliseconds.
+	Elapsed int64 `json:"elapsed_ms"`
+	// Status is normally ok, error, or timeout.
+	Status   string `json:"status"`
 	ToolName string `json:"tool"`
 }
 
-// BuiltinHandler 内置工具执行函数签名。
-// args 是解析后的参数 map；raw 是原始 JSON（需要透传时用）。
+// BuiltinHandler receives decoded arguments and their original JSON. The context
+// provides cancellation/deadlines; handlers doing blocking work must observe it.
 type BuiltinHandler func(ctx context.Context, args map[string]any, raw string) (string, error)
 
-// Registry 内置工具注册表。
+// Registry maps stable tool codes to executable handlers. Registering metadata in
+// the database alone does not make an implementation available to Invoke.
 type Registry interface {
 	Register(code string, h BuiltinHandler)
 	Get(code string) (BuiltinHandler, bool)

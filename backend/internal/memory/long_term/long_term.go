@@ -1,10 +1,7 @@
-// Package long_term 长期记忆（mem0 思路：抽取 → 去重合并 → 召回注入，td.md §7.6）。
-//
-// 流程：
-//
-//	写入: 每 N 条消息 → LLM 抽取事实(JSON 数组) → 向量化
-//	      → 相似查询(阈值) → LLM 判定 ADD/UPDATE/DELETE/NOOP → 落库+向量
-//	召回: 对话前 top-k 相似记忆注入 system
+// Package long_term maintains durable user facts through model-assisted extraction
+// and reconciliation. PostgreSQL stores fact content and lifecycle state; Milvus
+// provides semantic candidates. Recall filters candidate IDs against active
+// records for the requested user and optional agent before returning prompt text.
 package long_term
 
 import (
@@ -19,7 +16,8 @@ import (
 	"github.com/chengpeng-cp/nexus-agent/internal/vector"
 )
 
-// MemoryRepo 记忆元数据访问。
+// MemoryRepo supplies durable facts and scope filtering without exposing a
+// database client to the extraction pipeline.
 type MemoryRepo interface {
 	Create(ctx context.Context, m *model.Memory) error
 	UpdateContent(ctx context.Context, id int64, content string) error
@@ -27,22 +25,28 @@ type MemoryRepo interface {
 	ListActive(ctx context.Context, userID int64, agentID *int64, limit int) ([]model.Memory, error)
 }
 
-// Config 长期记忆参数。
+// Config holds extraction/recall defaults. RecallTopK is the vector candidate
+// limit; extraction message batching is selected by the calling service.
 type Config struct {
-	SimilarityThreshold float32 // 相似去重阈值
-	RecallTopK          int     // 召回条数
-	ExtractBatch        int     // 每次抽取的消息条数
+	// SimilarityThreshold is retained as configuration metadata; the current
+	// reconciliation path does not apply a numeric similarity cutoff.
+	SimilarityThreshold float32
+	RecallTopK          int
+	// ExtractBatch does not schedule extraction; the caller supplies the message batch.
+	ExtractBatch int
 }
 
-// DefaultConfig 默认参数。
+// DefaultConfig selects three recall candidates and the extraction defaults.
 func DefaultConfig() Config {
 	return Config{SimilarityThreshold: 0.88, RecallTopK: 3, ExtractBatch: 6}
 }
 
-// Manager 长期记忆管理器。
+// Manager combines model callbacks, fact persistence, and the shared memories
+// vector collection. Model callbacks allow service-side configuration resolution
+// without embedding provider credentials into stored memory records.
 type Manager struct {
 	gateway    *llm.Gateway
-	extractMdl func() *llm.ModelDescriptor // 抽取用低成本模型（实时解析取值函数）
+	extractMdl func() *llm.ModelDescriptor
 	embedMdl   func() *llm.ModelDescriptor
 	repo       MemoryRepo
 	store      vector.Store
@@ -50,7 +54,8 @@ type Manager struct {
 	cfg        Config
 }
 
-// NewManager 构造（传入 service 层 Default*() 实时解析函数，改配置无需重启）。
+// NewManager uses the shared memories collection and resolves extraction and
+// embedding models on demand through the supplied callbacks.
 func NewManager(gateway *llm.Gateway, extractMdl, embedMdl func() *llm.ModelDescriptor, repo MemoryRepo, store vector.Store) *Manager {
 	return &Manager{
 		gateway: gateway, extractMdl: extractMdl, embedMdl: embedMdl,
@@ -58,19 +63,23 @@ func NewManager(gateway *llm.Gateway, extractMdl, embedMdl func() *llm.ModelDesc
 	}
 }
 
-// extractPrompt 事实抽取提示词。
-const extractPrompt = `从对话中提取关于用户的长期有用事实（偏好、背景、约束、进行中的事项）。
-规则：1. 每条事实一句独立陈述；2. 只输出 JSON 数组，无其他文字；3. 无可提取内容输出 []。
-示例：["用户偏好使用 Go 语言","用户正在准备系统设计面试"]`
+// extractPrompt requests independent durable facts rather than a conversation
+// summary. Output is parsed as a JSON array before any embeddings are requested.
+const extractPrompt = `Extract facts about the user that will remain useful over time (preferences, background, constraints, and ongoing activities).
+Rules: 1. Write each fact as a standalone statement. 2. Output only a JSON array, with no additional text. 3. Output [] if there are no facts to extract.
+Example: ["The user prefers Go","The user is preparing for a system design interview"]`
 
-// opsPrompt 记忆操作判定提示词。
-const opsPrompt = `基于新记忆与已有记忆列表，判定每条新记忆的操作：
-ADD(新增)、UPDATE(id,更新为)、DELETE(id,过时删除)、NOOP(重复忽略)。
-只输出 JSON 数组：[{"op":"ADD","content":"..."},{"op":"UPDATE","id":1,"content":"..."},{"op":"DELETE","id":2}]`
+// opsPrompt asks the model to reconcile new facts with the scoped semantic
+// candidates using ADD, UPDATE, DELETE, or NOOP operations.
+const opsPrompt = `Compare the new memories with the existing memories and choose an operation for each new memory:
+ADD (create), UPDATE (id, replacement content), DELETE (id, remove outdated memory), or NOOP (ignore duplicates).
+Output only a JSON array: [{"op":"ADD","content":"..."},{"op":"UPDATE","id":1,"content":"..."},{"op":"DELETE","id":2}]`
 
-// ExtractAndStore 从消息中抽取事实并写入记忆。
+// ExtractAndStore extracts fact strings, embeds them, finds existing candidates,
+// and requests reconciliation operations from the model. It runs only when called;
+// periodic or per-response scheduling and background timeouts belong to services.
+// Writes are best effort and are not a database/vector transaction.
 func (m *Manager) ExtractAndStore(ctx context.Context, userID int64, agentID *int64, msgs []llm.Message) error {
-	// ① LLM 抽取事实
 	var b strings.Builder
 	for _, msg := range msgs {
 		b.WriteString(msg.Role + ": " + msg.Content + "\n")
@@ -86,21 +95,22 @@ func (m *Manager) ExtractAndStore(ctx context.Context, userID int64, agentID *in
 		return err
 	}
 
+	// A response without a valid, non-empty fact array is treated as nothing to store.
 	var facts []string
 	if err := json.Unmarshal([]byte(extractJSON(resp.Content)), &facts); err != nil || len(facts) == 0 {
-		return nil // 无事实或解析失败静默跳过
+		return nil
 	}
 
-	// ② 向量化事实
 	factVecs, err := m.gateway.Embed(ctx, m.embedMdl(), facts)
 	if err != nil {
 		return fmt.Errorf("embed facts: %w", err)
 	}
 
-	// ③ 相似查询已有记忆
+	// Use the first new fact to obtain semantic candidates, then match IDs against
+	// active records in this user/agent scope before exposing candidate content.
 	existing, err := m.store.Search(ctx, m.collection, factVecs[0], 10)
 	if err != nil {
-		existing = nil // 检索失败不阻塞写入
+		existing = nil
 	}
 	candidates := make([]string, 0, len(existing))
 	for _, h := range existing {
@@ -113,8 +123,7 @@ func (m *Manager) ExtractAndStore(ctx context.Context, userID int64, agentID *in
 		}
 	}
 
-	// ④ LLM 判定操作
-	opsMsg := fmt.Sprintf("已有记忆: [%s]\n新事实: %q", strings.Join(candidates, ","), facts)
+	opsMsg := fmt.Sprintf("Existing memories: [%s]\nNew facts: %q", strings.Join(candidates, ","), facts)
 	opsResp, _, err := m.gateway.Chat(ctx, m.extractMdl(), nil, &llm.ChatRequest{
 		Messages: []llm.Message{
 			{Role: llm.RoleSystem, Content: opsPrompt},
@@ -126,6 +135,8 @@ func (m *Manager) ExtractAndStore(ctx context.Context, userID int64, agentID *in
 		return err
 	}
 
+	// The second model response determines persistence operations. Invalid operation
+	// JSON yields an empty operation list rather than failing the chat response.
 	var ops []struct {
 		Op      string `json:"op"`
 		ID      int64  `json:"id"`
@@ -133,7 +144,9 @@ func (m *Manager) ExtractAndStore(ctx context.Context, userID int64, agentID *in
 	}
 	_ = json.Unmarshal([]byte(extractJSON(opsResp.Content)), &ops)
 
-	// ⑤ 执行操作
+	// ADD associates the operation position with the corresponding fact vector.
+	// UPDATE changes SQL content only; DELETE archives the SQL record so future
+	// scoped recall filters it out even if its old vector remains present.
 	for i, op := range ops {
 		switch op.Op {
 		case "ADD", "":
@@ -161,7 +174,10 @@ func (m *Manager) ExtractAndStore(ctx context.Context, userID int64, agentID *in
 	return nil
 }
 
-// Recall 召回相关记忆（注入 system 的文本）。
+// Recall embeds the query, obtains a global vector top-k, then retains only IDs
+// present in active records for the requested user/agent. Because scope filtering
+// happens after vector search, fewer than RecallTopK facts may be returned.
+// Hit counters and timestamps on returned values are not persisted by this method.
 func (m *Manager) Recall(ctx context.Context, userID int64, agentID *int64, query string) ([]model.Memory, error) {
 	vec, err := m.gateway.Embed(ctx, m.embedMdl(), []string{query})
 	if err != nil {
@@ -197,7 +213,8 @@ func (m *Manager) Recall(ctx context.Context, userID int64, agentID *int64, quer
 	return out, nil
 }
 
-// extractJSON 提取 JSON 数组。
+// extractJSON takes the outer array from model text, tolerating surrounding
+// explanation or code fences. Missing brackets produce an empty array string.
 func extractJSON(s string) string {
 	if i := strings.Index(s, "["); i >= 0 {
 		if j := strings.LastIndex(s, "]"); j > i {

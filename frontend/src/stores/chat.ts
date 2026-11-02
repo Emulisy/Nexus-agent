@@ -1,22 +1,9 @@
 /**
- * 对话状态机 —— 前端的心脏。
- *
- * 职责：
- * 1. 会话列表管理（以服务端为唯一事实源，流结束后重新拉取）；
- * 2. SSE 流式渲染：12 种事件 → UI 状态（与 handler_chat.go 协议一一对应）；
- * 3. 中断（abort）、重发（同一 session 再发一条）。
- *
- * 设计要点（ep19 走读 2 的映射表即本文件的事件分支）：
- * - meta       建气泡占位，记录 session_id；
- * - reasoning  折叠区灰字逐字上屏；
- * - plan       计划卡片逐条勾选；
- * - tool_call  决策链时间线追加"调用中"节点；
- * - tool_result节点回填结果与耗时；
- * - agent_event多智能体委派动效；
- * - refs       引用角标数据；
- * - usage      成本角标；
- * - delta      打字机正文；
- * - done/error 终态：解禁输入框；error 显示重试条。
+ * Manage conversation history and the transient assistant response.
+ * The server owns persisted messages; optimistic user messages and SSE state are
+ * replaced by a fresh history fetch when the stream settles. Only one active
+ * stream is allowed in this store, and its AbortController handle stays outside
+ * reactive state. Agent and model selections persist until explicitly changed.
  */
 import { create } from 'zustand';
 import { runChatStream, type StreamHandle } from '@/lib/sse';
@@ -34,48 +21,54 @@ import type {
   UsageData,
 } from '@/types/chat';
 
-/** 正在流式生成的助手消息（done 后由服务端 messages 替换） */
 export interface StreamingMsg {
   sessionId: string;
   content: string;
   reasoning: string;
   plan?: PlanData;
-  /** tool_call.id → 节点（call 与 result 按 id 配对） */
+  /** Match tool calls and results by ID. */
   tools: Record<string, ToolCallData & Partial<ToolResultData>>;
+  /**
+   * Delegation/progress payloads retained for state consumers; the current chat
+   * view does not render a dedicated panel for these events.
+   */
   agentEvents: AgentEventData[];
   refs: RAGRef[];
   usage?: UsageData;
-  /** streaming / done / error */
   status: 'streaming' | 'done' | 'error';
   errorMessage?: string;
-  /** meta.expert：多智能体命中专家 */
   expert?: string;
 }
 
 interface ChatState {
   sessions: Session[];
   sessionsTotal: number;
-  /** 当前会话（undefined = 新对话） */
+  /** Undefined starts a new session. */
   activeSessionId?: string;
-  /** 历史消息（服务端事实源） */
   messages: Message[];
-  /** 流式中的消息（null = 空闲） */
   streaming: StreamingMsg | null;
-  /** 对话中的 Agent（undefined = 平台默认） */
+  /** Undefined uses the platform default. */
   activeAgentId?: number;
-  /** 本次发送使用的模型（对话页选择器；undefined = 沿用 Agent 绑定模型） */
+  /** Undefined uses the agent's configured model. */
   activeModelId?: number;
 
   loadSessions: () => Promise<void>;
   selectSession: (id: string) => Promise<void>;
+  /**
+   * Clear conversation context without creating a server record yet. The next
+   * send omits session_id, and its meta event supplies the newly created ID.
+   */
   newSession: () => void;
   setActiveAgent: (id?: number) => void;
   setActiveModel: (id?: number) => void;
   send: (content: string) => Promise<void>;
+  /**
+   * Cancel the active client fetch. The send continuation still runs after done
+   * resolves and reconciles whatever messages the backend has persisted.
+   */
   stop: () => void;
   renameSession: (id: string, title: string) => Promise<void>;
   removeSession: (id: string) => Promise<void>;
-  /** 消息列表页"记住这次对话"后调用方自行刷新 */
 }
 
 let handle: StreamHandle | null = null;
@@ -89,34 +82,54 @@ export const useChat = create<ChatState>((set, get) => ({
   activeAgentId: undefined,
   activeModelId: undefined,
 
+  /**
+   * Refresh the first page of server session summaries. This store keeps the
+   * matching total even though the current navigation rail renders at most 100 rows.
+   */
   loadSessions: async () => {
     const page = await listSessions({ page: 1, page_size: 100 });
     set({ sessions: page.list, sessionsTotal: page.total });
   },
 
-  /** 切换会话：拉历史全量渲染（幂等 —— 服务端消息列表是唯一事实源） */
+  /**
+   * Abort a current stream, clear its transient bubble, and load the selected
+   * session history and restore its saved agent. A model override from another
+   * conversation must not silently replace the restored agent's model.
+   */
   selectSession: async (id) => {
     if (get().streaming) get().stop();
-    set({ activeSessionId: id, messages: [], streaming: null });
+    const session = get().sessions.find((s) => s.id === id);
+    set({ activeSessionId: id, activeAgentId: session?.agent_id ?? undefined, activeModelId: undefined, messages: [], streaming: null });
     const msgs = await listMessages(id);
     set({ messages: msgs });
   },
 
-  /** 开新对话：清空当前上下文 */
   newSession: () => {
     if (get().streaming) get().stop();
     set({ activeSessionId: undefined, messages: [], streaming: null });
   },
 
-  setActiveAgent: (id) => set({ activeAgentId: id }),
+  // A different agent starts a separate conversation with its configured model.
+  setActiveAgent: (id) => {
+    if (get().streaming || get().activeAgentId === id) return;
+    set({ activeAgentId: id, activeModelId: undefined, activeSessionId: undefined, messages: [] });
+  },
 
   setActiveModel: (id) => set({ activeModelId: id }),
 
-  /** 发送一条消息并消费 SSE 流 */
+  /**
+   * Append an optimistic user message and start one transient assistant response.
+   * Only the new content and optional selection IDs are sent; the server owns
+   * history/context assembly. Once the reader settles, reload persisted messages
+   * and session summaries instead of treating streamed text as a saved record.
+   */
   send: async (content) => {
-    if (get().streaming) return; // 流式中禁止并发发送
+    if (get().streaming) return;
 
-    // 乐观插入用户消息（服务端确认以 done 后的 reload 为准）
+    /**
+     * Temporary IDs are negative so the local row stays distinct from persisted
+     * positive message IDs until history is fetched again.
+     */
     const optimistic: Message = {
       id: -Date.now(),
       session_id: get().activeSessionId ?? '',
@@ -127,34 +140,35 @@ export const useChat = create<ChatState>((set, get) => ({
       first_token_ms: 0,
       latency_ms: 0,
       status: 1,
-      trace_id: '',
       created_at: new Date().toISOString(),
     };
     set((s) => ({ messages: [...s.messages, optimistic], streaming: emptyStreaming() }));
 
+    /**
+     * Snapshot the token for the raw streaming fetch; it does not use the REST
+     * client automatic 401 refresh and replay path.
+     */
     const token = useAuth.getState().accessToken ?? '';
     const h = await runChatStream(
       { session_id: get().activeSessionId, agent_id: get().activeAgentId, content, model_config_id: get().activeModelId },
       (ev) => {
-        // 每个事件 → 不可变状态更新
         set((s) => (s.streaming ? { streaming: reduce(s.streaming, ev.event, ev.data) } : s));
       },
       token,
     );
     handle = h;
-    await h.done; // 等流结束（done/error/中断 都会 resolve）
+    await h.done;
 
-    // 收尾：以服务端为准刷新事实源
+    // Reload persisted messages after the stream ends.
     const finalStatus = get().streaming?.status;
     if (finalStatus === 'error') {
-      toast.err(get().streaming?.errorMessage ?? '对话失败');
+      toast.err(get().streaming?.errorMessage ?? 'Chat failed');
     }
     handle = null;
-    // 首轮对话时 activeSessionId 为空，从 meta 事件里拿服务端分配的会话 ID
+    // The first response supplies the server-assigned session ID.
     const sid = get().activeSessionId ?? get().streaming?.sessionId;
     set({ streaming: null, ...(sid ? { activeSessionId: sid } : {}) });
     if (sid) {
-      // 会话标题/条数/消息内容都可能已变，全部重拉
       const [msgs, sessions] = await Promise.all([
         listMessages(sid),
         listSessions({ page: 1, page_size: 100 }),
@@ -165,11 +179,11 @@ export const useChat = create<ChatState>((set, get) => ({
     }
   },
 
-  /** 用户中断：abort 后流处理会兜底 error 事件，走统一的收尾逻辑 */
   stop: () => {
     handle?.abort();
   },
 
+  /** Patch the visible summary only after the server accepts the new title. */
   renameSession: async (id, title) => {
     await renameApi(id, title);
     set((s) => ({
@@ -177,6 +191,10 @@ export const useChat = create<ChatState>((set, get) => ({
     }));
   },
 
+  /**
+   * Delete remotely before removing the summary. Deleting the active session
+   * also clears its current message list and selects the new-conversation state.
+   */
   removeSession: async (id) => {
     await deleteSession(id);
     set((s) => ({
@@ -187,7 +205,10 @@ export const useChat = create<ChatState>((set, get) => ({
   },
 }));
 
-/** 新建流式消息骨架 */
+/**
+ * Create an assistant placeholder before the first network frame arrives.
+ * Its empty sessionId is filled by meta for a newly created conversation.
+ */
 function emptyStreaming(): StreamingMsg {
   return {
     sessionId: '',
@@ -200,7 +221,12 @@ function emptyStreaming(): StreamingMsg {
   };
 }
 
-/** SSE 事件归约器：单事件 → 新状态（不可变） */
+/**
+ * Apply one SSE event without mutating previous store values. Tool calls and
+ * results join by ID, text fragments append, and terminal events only change
+ * status; the transport still controls when the completion promise settles.
+ * Unknown events remain harmless so the protocol can grow independently.
+ */
 function reduce(
   cur: StreamingMsg,
   event: string,
@@ -231,6 +257,7 @@ function reduce(
     case 'tool_result': {
       const tr = data as unknown as ToolResultData;
       const node = cur.tools[tr.id];
+      /** A result without a known call cannot update an existing timeline node. */
       if (!node) return cur;
       return {
         ...cur,
@@ -247,6 +274,10 @@ function reduce(
     case 'usage':
       return { ...cur, usage: data as unknown as UsageData };
 
+    /**
+     * A terminal event updates presentation immediately. Stream cleanup and the
+     * history reload wait for the reader completion promise.
+     */
     case 'done':
       return { ...cur, status: 'done' };
 
@@ -254,10 +285,10 @@ function reduce(
       return {
         ...cur,
         status: 'error',
-        errorMessage: String(data.message ?? '对话失败'),
+        errorMessage: String(data.message ?? 'Chat failed'),
       };
 
     default:
-      return cur; // 未知事件静默忽略（协议向后兼容）
+      return cur; // Ignore unknown events for protocol compatibility.
   }
 }

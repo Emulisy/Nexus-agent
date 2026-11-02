@@ -1,4 +1,7 @@
-// 会话与消息数据访问（实现 memory/session.Repo 接口）。
+// Session persistence stores conversation records, messages, and denormalized statistics.
+// Queries here do not infer ownership; callers load/check the session owner where
+// needed. Message inserts and counter updates are separate operations rather
+// than a transaction spanning a complete streamed response.
 package repo
 
 import (
@@ -10,17 +13,17 @@ import (
 	"github.com/chengpeng-cp/nexus-agent/internal/model"
 )
 
-// SessionRepo 会话/消息表。
+// SessionRepo manages session/message tables through the shared GORM handle.
 type SessionRepo struct {
 	db *gorm.DB
 }
 
-// CreateSession 创建会话。
+// CreateSession inserts metadata and lets database defaults populate UUID, title, status, and timestamps.
 func (r *SessionRepo) CreateSession(ctx context.Context, s *model.Session) error {
 	return r.db.WithContext(ctx).Create(s).Error
 }
 
-// GetSession 按 UUID 查询。
+// GetSession loads a UUID-keyed session without applying a user filter; services validate its owner.
 func (r *SessionRepo) GetSession(ctx context.Context, id string) (*model.Session, error) {
 	var s model.Session
 	if err := r.db.WithContext(ctx).First(&s, "id = ?", id).Error; err != nil {
@@ -29,7 +32,9 @@ func (r *SessionRepo) GetSession(ctx context.Context, id string) (*model.Session
 	return &s, nil
 }
 
-// ListSessions 用户会话列表（置顶优先，再按最近消息时间倒序）。
+// ListSessions returns active sessions for one user and an unpaginated total.
+// Pinned sessions sort first, then last activity (or creation time when no
+// message timestamp exists) in descending order.
 func (r *SessionRepo) ListSessions(ctx context.Context, userID int64, offset, limit int) ([]model.Session, int64, error) {
 	var (
 		list  []model.Session
@@ -44,25 +49,27 @@ func (r *SessionRepo) ListSessions(ctx context.Context, userID int64, offset, li
 	return list, total, err
 }
 
-// UpdateSession 更新会话（标题/置顶/归档）。
+// UpdateSession saves the complete loaded session, including zero-valued fields.
 func (r *SessionRepo) UpdateSession(ctx context.Context, s *model.Session) error {
 	return r.db.WithContext(ctx).Save(s).Error
 }
 
-// DeleteSession 删除会话（软删由 gorm.DeletedAt 支持；此处物理删除消息级联在 service）。
+// DeleteSession physically deletes the session row; related-row cleanup follows database foreign keys.
 func (r *SessionRepo) DeleteSession(ctx context.Context, id string) error {
 	return r.db.WithContext(ctx).Delete(&model.Session{}, "id = ?", id).Error
 }
 
-// CreateMessage 追加消息。
+// CreateMessage persists a message and populates its generated ID for subsequent metadata/usage references.
 func (r *SessionRepo) CreateMessage(ctx context.Context, m *model.Message) error {
 	return r.db.WithContext(ctx).Create(m).Error
 }
 
-// ListMessages 会话消息（时间正序，limit 取最近 N 条）。
+// ListMessages limits the query to the newest IDs and reverses them for chronological context.
+// The result includes all stored roles; the service chooses which roles/content
+// to replay into the next LLM request.
 func (r *SessionRepo) ListMessages(ctx context.Context, sessionID string, limit int) ([]model.Message, error) {
 	var list []model.Message
-	// 子查询取最近 N 条再正序输出，保证上下文顺序
+	// Fetch newest first to apply the limit, then reverse for conversation order.
 	err := r.db.WithContext(ctx).
 		Where("session_id = ?", sessionID).
 		Order("id DESC").Limit(limit).
@@ -70,23 +77,15 @@ func (r *SessionRepo) ListMessages(ctx context.Context, sessionID string, limit 
 	if err != nil {
 		return nil, err
 	}
-	// 反转为时间正序
 	for i, j := 0, len(list)-1; i < j; i, j = i+1, j-1 {
 		list[i], list[j] = list[j], list[i]
 	}
 	return list, nil
 }
 
-// ListMessagesAfter 增量拉取：ID 之后的消息（长期记忆抽取用）。
-func (r *SessionRepo) ListMessagesAfter(ctx context.Context, sessionID string, afterID int64, limit int) ([]model.Message, error) {
-	var list []model.Message
-	err := r.db.WithContext(ctx).
-		Where("session_id = ? AND id > ? AND role IN ?", sessionID, afterID, []string{"user", "assistant"}).
-		Order("id ASC").Limit(limit).Find(&list).Error
-	return list, err
-}
-
-// UpdateSessionStats 会话统计累加（消息数 +1、Token 累计、最近消息时间）。
+// UpdateSessionStats atomically increments message_count and token_usage in SQL.
+// It also sets last_msg_at. Each call adds one message, so chat invokes it once
+// for the user turn and again for the persisted assistant response.
 func (r *SessionRepo) UpdateSessionStats(ctx context.Context, sessionID string, addTokens int64) error {
 	return r.db.WithContext(ctx).Model(&model.Session{}).
 		Where("id = ?", sessionID).
@@ -97,31 +96,11 @@ func (r *SessionRepo) UpdateSessionStats(ctx context.Context, sessionID string, 
 		}).Error
 }
 
-// RetitleSession 首轮对话后自动改标题（截断首条用户消息）。
+// RetitleSession updates a title only while it equals the default new-conversation title.
+// It leaves previously renamed sessions unchanged and does not report an error
+// when no row matches that title condition.
 func (r *SessionRepo) RetitleSession(ctx context.Context, sessionID, title string) error {
 	return r.db.WithContext(ctx).Model(&model.Session{}).
-		Where("id = ? AND title = '新对话'", sessionID).
+		Where("id = ? AND title = ?", sessionID, "New chat").
 		Update("title", title).Error
-}
-
-// CountMessages 会话消息计数。
-func (r *SessionRepo) CountMessages(ctx context.Context, sessionID string) (int64, error) {
-	var n int64
-	err := r.db.WithContext(ctx).Model(&model.Message{}).
-		Where("session_id = ?", sessionID).Count(&n).Error
-	return n, err
-}
-
-// GetMessage 单条消息。
-func (r *SessionRepo) GetMessage(ctx context.Context, id int64) (*model.Message, error) {
-	var m model.Message
-	if err := r.db.WithContext(ctx).First(&m, id).Error; err != nil {
-		return nil, err
-	}
-	return &m, nil
-}
-
-// UpdateMessage 更新消息（决策链落库用）。
-func (r *SessionRepo) UpdateMessage(ctx context.Context, m *model.Message) error {
-	return r.db.WithContext(ctx).Save(m).Error
 }

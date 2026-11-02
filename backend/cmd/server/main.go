@@ -1,34 +1,27 @@
-// NexusAgent API 服务入口：全项目依赖装配（main 是唯一知道所有具体实现的地方）。
-//
-// 装配顺序（依赖方向决定，教学 Ep 02 的"总装车间"）：
-//
-//	配置 → 日志 → 追踪 → 基础设施(PG/Redis/Milvus/MinIO)
-//	  → 安全(JWT/加密) → 网关/向量库 → 工具系统 → service
-//	  → RAG 引擎 → 工作流引擎 → 长期记忆 → kb_search 工具
-//	  → Hertz 路由 → A2A 服务端 → 优雅关停
+// Command server assembles the API process and its external dependencies.
+// Configuration, storage clients, model resolution, and tool execution are shared
+// by the HTTP services. Engines that depend on those services are attached after
+// construction. Database migrations and the document worker run as separate commands.
 package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net"
 	"net/http"
-	_ "net/http/pprof" // Ep18 演示：导入即把 pprof handler 注册到 DefaultServeMux
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
-
-	"github.com/cloudwego/hertz/pkg/app/server"
-	"github.com/minio/minio-go/v7"
 
 	"github.com/chengpeng-cp/nexus-agent/internal/a2a"
 	"github.com/chengpeng-cp/nexus-agent/internal/api"
 	"github.com/chengpeng-cp/nexus-agent/internal/config"
 	"github.com/chengpeng-cp/nexus-agent/internal/infra"
 	"github.com/chengpeng-cp/nexus-agent/internal/llm"
+	"github.com/chengpeng-cp/nexus-agent/internal/logging"
 	"github.com/chengpeng-cp/nexus-agent/internal/memory/long_term"
-	"github.com/chengpeng-cp/nexus-agent/internal/observability"
-	"github.com/chengpeng-cp/nexus-agent/internal/observability/logger"
 	"github.com/chengpeng-cp/nexus-agent/internal/rag/engine"
 	"github.com/chengpeng-cp/nexus-agent/internal/repo"
 	"github.com/chengpeng-cp/nexus-agent/internal/security"
@@ -37,8 +30,10 @@ import (
 	"github.com/chengpeng-cp/nexus-agent/internal/vector"
 	"github.com/chengpeng-cp/nexus-agent/internal/worker"
 	"github.com/chengpeng-cp/nexus-agent/internal/workflow"
+	"github.com/minio/minio-go/v7"
 )
 
+// main reports startup failures to stderr and exits with a nonzero status.
 func main() {
 	if err := run(); err != nil {
 		fmt.Fprintf(os.Stderr, "server exited: %v\n", err)
@@ -46,28 +41,19 @@ func main() {
 	}
 }
 
+// run constructs dependencies before opening the HTTP listener.
+// Storage and service initialization failures stop startup; the code
+// sandbox is optional. A termination signal cancels the application context and
+// gives the HTTP server the configured shutdown interval to drain requests.
 func run() error {
-	// ===== ① 配置与日志 =====
 	cfg, err := config.Load("")
 	if err != nil {
 		return err
 	}
-	logger.Init(cfg.Log.Level, cfg.Log.Format)
+	logging.Init(cfg.Log.Level, cfg.Log.Format)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// ===== ② 可观测性 =====
-	if cfg.Observability.OtelEnabled && cfg.Observability.OtelEndpoint != "" {
-		shutdown, err := observability.InitTracer(ctx, cfg.Observability.OtelEndpoint)
-		if err != nil {
-			observability.LogWarn("otel init failed, tracing disabled", "err", err.Error())
-		} else {
-			defer shutdown(context.Background())
-		}
-	}
-	observability.InitMetrics()
-
-	// ===== ③ 基础设施 =====
 	db, err := infra.NewPG(ctx, &cfg.PG)
 	if err != nil {
 		return fmt.Errorf("pg: %w", err)
@@ -84,25 +70,21 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("minio: %w", err)
 	}
-	// 对象桶不存在则创建（已存在时忽略）
 	if err := mio.MakeBucket(ctx, cfg.MinIO.Bucket, minio.MakeBucketOptions{}); err != nil {
 		if exists, _ := mio.BucketExists(ctx, cfg.MinIO.Bucket); !exists {
 			return fmt.Errorf("minio bucket: %w", err)
 		}
 	}
 
-	// ===== ④ 安全组件 =====
 	encryptor, err := security.NewEncryptor(cfg.SecretKey)
 	if err != nil {
 		return fmt.Errorf("encryptor: %w", err)
 	}
 	jwtMgr := security.NewJWTManager(cfg.JWT.Secret, cfg.JWT.AccessTTL, cfg.JWT.RefreshTTL)
 
-	// ===== ⑤ LLM 网关与向量库 =====
 	gateway := llm.NewGateway(&cfg.LLM)
 	store := vector.NewMilvusStore(mcli)
 
-	// ===== ⑥ 数据访问与工具系统 =====
 	repos := repo.New(db)
 	reg := tool.NewRegistry()
 	tool.RegisterSimple(reg)
@@ -110,19 +92,18 @@ func run() error {
 	tool.RegisterFiles(reg, tool.FileOpsConfig{BaseDir: "./data/files", MaxSize: 10 << 20})
 	tool.RegisterDBQuery(reg, db)
 	if cfg.Sandbox.Enabled {
-		// Docker 沙箱失败不阻断启动：code_exec 不可用而已（降级思维）
+		// Continue serving other tools when the code sandbox is unavailable.
 		if sandbox, err := tool.NewSandbox(tool.SandboxConfig{
-			Image: cfg.Sandbox.Image, Memory: cfg.Sandbox.Memory,
-			CPUs: cfg.Sandbox.CPUs, Timeout: cfg.Sandbox.Timeout, PoolSize: cfg.Sandbox.PoolSize,
+			Image:   cfg.Sandbox.Image,
+			Timeout: cfg.Sandbox.Timeout,
 		}); err != nil {
-			observability.LogWarn("sandbox init failed, code_exec disabled", "err", err.Error())
+			logging.LogWarn("sandbox init failed, code_exec disabled", "err", err.Error())
 		} else {
-			tool.RegisterCodeExec(reg, sandbox, db)
+			tool.RegisterCodeExec(reg, sandbox)
 		}
 	}
 	executor := tool.NewExecutor(repos.Tool, reg, tool.ExecutorConfig{DefaultTimeout: 30 * time.Second})
 
-	// ===== ⑦ service 层 =====
 	svcs, err := service.New(service.Deps{
 		Cfg: cfg, Repos: repos, Gateway: gateway,
 		Encryptor: encryptor, JWT: jwtMgr, RDB: rdb,
@@ -133,12 +114,10 @@ func run() error {
 		return fmt.Errorf("services: %w", err)
 	}
 
-	// ===== ⑧ RAG 引擎（注入实时解析函数，改配置无需重启） =====
 	ragEngine := engine.New(gateway, store, repos.KB, &cfg.RAG, cfg.Milvus.Dim)
 	ragEngine.SetModels(svcs.DefaultEmbedding, svcs.DefaultRerank)
 	svcs.SetRAGEngine(ragEngine)
 
-	// ===== ⑨ 工作流引擎（复用既有组件，不重复造轮子） =====
 	svcs.Workflow.SetEngine(workflow.New(workflow.Deps{
 		Gateway:      gateway,
 		Tools:        executor,
@@ -148,60 +127,53 @@ func run() error {
 		SubRunner:    svcs.Workflow.SubflowRunner(),
 	}))
 
-	// ===== ⑩ 长期记忆（抽取用低成本 chat 模型，实时解析） =====
 	memoryMgr := long_term.NewManager(gateway, svcs.DefaultChat, svcs.DefaultEmbedding, repos.Memory, store)
 	svcs.Chat.SetLongTermMemory(memoryMgr)
 	svcs.Memory.SetManager(memoryMgr)
 
-	// ===== ⑪ 对象存储与 kb_search 工具（依赖 RAG 引擎，最后注册） =====
 	svcs.KB.SetMinIO(mio, cfg.MinIO.Bucket)
 	tool.RegisterKBSearch(reg, kbSearchFunc(svcs, ragEngine))
 
-	// ===== ⑫ Hertz 服务 =====
-	h := server.New(
-		server.WithHostPorts(":"+cfg.HTTP.Port),
-		server.WithReadTimeout(30*time.Second),
-		server.WithWriteTimeout(0), // SSE 长连接不超时
-		server.WithIdleTimeout(120*time.Second),
-	)
-	root := h.Group("/")
-	// Tracing 放最外层：根 span 覆盖整条中间件链与 handler
-	root.Use(api.Tracing(), api.Recovery(), api.CORS(), api.AccessLog())
-	root.GET("/healthz", api.Healthz())
-	root.GET("/metrics", api.Metrics())
-	api.Register(root, api.New(svcs), jwtMgr)
+	h := &http.Server{
+		Addr:              "127.0.0.1:" + cfg.HTTP.Port,
+		Handler:           api.NewRouter(api.New(svcs), jwtMgr),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		// No write timeout: chat streams and synchronous workflows may be long-lived.
+		BaseContext: func(net.Listener) context.Context { return ctx },
+	}
 
-	// ===== ⑫' pprof 诊断端口（Ep18 演示）：单独监听 6060，与业务 8080 完全隔离 =====
-	// 生产环境此端口绝不能对外暴露。用法：
-	//   go tool pprof -http :8090 "http://localhost:6060/debug/pprof/profile?seconds=15"
-	//   curl -s "http://localhost:6060/debug/pprof/goroutine?debug=1" | head -3
-	go func() { _ = http.ListenAndServe("localhost:6060", nil) }()
-
-	// ===== ⑬ A2A 对外端点（独立 net/http 端口，回调标准对话链路） =====
 	if cfg.A2A.Enabled {
 		startA2AServer(cfg, svcs)
 	}
 
-	observability.LogInfo("nexus-agent server started", "port", cfg.HTTP.Port, "env", cfg.Env)
+	logging.LogInfo("SupaAgent server started", "port", cfg.HTTP.Port, "env", cfg.Env)
 
-	// Spin 必须调用：server.New 只做装配不监听端口，Spin 才真正 bind :port。
-	// 放在 goroutine 里，主 goroutine 负责等信号，两者都触发优雅关停。
-	go h.Spin()
+	serverErr := make(chan error, 1)
+	go func() { serverErr <- h.ListenAndServe() }()
 
-	// ===== ⑭ 优雅关停 =====
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	<-quit
-	observability.LogInfo("shutting down...")
+	defer signal.Stop(quit)
+	select {
+	case <-quit:
+	case err := <-serverErr:
+		if !errors.Is(err, http.ErrServerClosed) {
+			return fmt.Errorf("http server: %w", err)
+		}
+	}
+	logging.LogInfo("shutting down...")
 
 	shutdownCtx, c := context.WithTimeout(context.Background(), cfg.HTTP.ShutdownTimeout)
 	defer c()
-	cancel() // 通知后台 goroutine
-	h.Shutdown(shutdownCtx)
-	return nil
+	cancel()
+	return h.Shutdown(shutdownCtx)
 }
 
-// startA2AServer 启动 A2A 对外端点。
+// startA2AServer exposes the local chat service on a separate net/http listener.
+// The advertised card disables streaming because the handler collects chat deltas
+// into one response. Listener failures are logged by its background goroutine.
 func startA2AServer(cfg *config.Config, svcs *service.Services) {
 	card := &a2a.AgentCard{
 		Name:        cfg.A2A.Name,
@@ -212,7 +184,7 @@ func startA2AServer(cfg *config.Config, svcs *service.Services) {
 		Capabilities: struct {
 			Streaming bool `json:"streaming"`
 		}{Streaming: false},
-		Skills: []a2a.AgentSkill{{Name: "chat", Description: "通用对话与工具调用"}},
+		Skills: []a2a.AgentSkill{{Name: "chat", Description: "General conversation and tool calling"}},
 	}
 	handler := func(ctx context.Context, text string) (string, error) {
 		return svcs.A2A.InvokeLocal(ctx, 0, text)
@@ -220,14 +192,17 @@ func startA2AServer(cfg *config.Config, svcs *service.Services) {
 	mux := http.NewServeMux()
 	a2a.NewServer(card, handler).RegisterRoutes(mux)
 	go func() {
-		observability.LogInfo("a2a server listening", "port", cfg.A2A.Port)
-		if err := http.ListenAndServe(":"+cfg.A2A.Port, mux); err != nil {
-			observability.LogError("a2a server exited", "err", err.Error())
+		logging.LogInfo("a2a server listening", "port", cfg.A2A.Port)
+		if err := http.ListenAndServe("127.0.0.1:"+cfg.A2A.Port, mux); err != nil {
+			logging.LogError("a2a server exited", "err", err.Error())
 		}
 	}()
 }
 
-// kbSearchFunc 组装 kb_search 工具的检索回调。
+// kbSearchFunc adapts RAG retrieval to the model-facing kb_search tool.
+// It requires an authenticated identity in context and loads the knowledge base
+// through an ownership-filtered query. Result count follows the RAG configuration;
+// the callback's topK argument is not applied here.
 func kbSearchFunc(svcs *service.Services, eng *engine.Engine) tool.KBSearchFunc {
 	return func(ctx context.Context, kbID int64, query string, topK int) (string, error) {
 		userID, ok := security.UserIDFromContext(ctx)

@@ -1,8 +1,7 @@
-// 模型管理服务：供应商/模型配置 CRUD 与"配置 → 运行时描述符"解析。
-//
-// 教学要点（td.md §8.1）：网关不查库 —— model_configs 是"声明态"（存在 DB、
-// api_key 加密），ModelDescriptor 是"运行态"（明文、可直接发起请求）。
-// 桥接两者（查库/解密/组装）正是 service 层的职责。
+// Model management separates persisted configuration from runtime descriptors.
+// Provider keys are encrypted before persistence and decrypted only for masked
+// views or gateway descriptors. Partial updates merge pointer-valued request
+// fields into existing records to preserve omitted credentials and status values.
 package service
 
 import (
@@ -14,33 +13,33 @@ import (
 	"github.com/chengpeng-cp/nexus-agent/internal/repo"
 )
 
-// 模型类型（与 model 包常量对齐的内部简写）。
+// Model-type strings mirror the persisted model types used by repository lookups.
 const (
 	modelTypeChat   = "chat"
 	modelTypeEmbed  = "embedding"
 	modelTypeRerank = "rerank"
 )
 
-// ModelService 模型管理。
+// ModelService manages provider/model records and delegates credential encryption through a small interface.
 type ModelService struct {
 	repos     *repo.Repos
 	encryptor Encryptor
 }
 
-// Encryptor 加密器接口（便于测试桩注入）。
+// Encryptor supplies reversible credential protection without coupling model management to one implementation.
 type Encryptor interface {
 	Encrypt(plain string) (string, error)
 	Decrypt(cipher string) (string, error)
 }
 
-// NewModelService 构造。
+// NewModelService binds configuration repositories and the credential encryptor.
 func NewModelService(repos *repo.Repos, enc Encryptor) *ModelService {
 	return &ModelService{repos: repos, encryptor: enc}
 }
 
-// ---- 供应商 CRUD ----
-
-// ListProviders 供应商列表（API Key 打码回显：前2位+****+后4位，"" 表示未配置）。
+// ListProviders builds views containing only masked credentials.
+// An unreadable stored key yields an empty mask so one decryption failure does
+// not prevent the rest of the provider list from loading.
 func (s *ModelService) ListProviders(ctx context.Context) ([]model.ProviderView, error) {
 	list, err := s.repos.LLM.ListProviders(ctx)
 	if err != nil {
@@ -49,7 +48,7 @@ func (s *ModelService) ListProviders(ctx context.Context) ([]model.ProviderView,
 	out := make([]model.ProviderView, 0, len(list))
 	for i := range list {
 		p := &list[i]
-		// 密文解密后打码；解密失败按未配置处理（不阻塞列表）
+		// Treat an unreadable key as unconfigured so the provider list remains available.
 		masked := ""
 		if plain, e := s.encryptor.Decrypt(p.APIKey); e == nil {
 			masked = model.MaskAPIKey(plain)
@@ -63,7 +62,8 @@ func (s *ModelService) ListProviders(ctx context.Context) ([]model.ProviderView,
 	return out, nil
 }
 
-// CreateProvider 创建供应商（api_key 加密落库，status 缺省启用）。
+// CreateProvider requires code, name, and base URL, encrypts the optional key,
+// and defaults status to enabled unless an explicit status was supplied.
 func (s *ModelService) CreateProvider(ctx context.Context, req *model.ProviderUpsert) error {
 	if req.Code == nil || req.Name == nil || req.BaseURL == nil {
 		return errcode.ErrMissingParam
@@ -77,7 +77,7 @@ func (s *ModelService) CreateProvider(ctx context.Context, req *model.ProviderUp
 		Name:    *req.Name,
 		BaseURL: *req.BaseURL,
 		APIKey:  enc,
-		Status:  1, // 默认启用；显式传 status 可覆盖
+		Status:  1,
 	}
 	if req.Status != nil {
 		p.Status = *req.Status
@@ -85,8 +85,9 @@ func (s *ModelService) CreateProvider(ctx context.Context, req *model.ProviderUp
 	return s.repos.LLM.CreateProvider(ctx, p)
 }
 
-// UpdateProvider 更新供应商（读-改-写合并：req 中 nil 字段保留原值）。
-// 修复历史 bug：此前整包 Save 绑定零值，未传 api_key 会清空密钥、未传 status 会停用。
+// UpdateProvider loads the stored provider and merges only supplied fields.
+// An empty API key is treated like an omitted key because edit forms do not
+// receive the original secret. Other pointer fields can explicitly write zero values.
 func (s *ModelService) UpdateProvider(ctx context.Context, id int64, req *model.ProviderUpsert) error {
 	p, err := s.repos.LLM.GetProvider(ctx, id)
 	if err != nil {
@@ -101,7 +102,7 @@ func (s *ModelService) UpdateProvider(ctx context.Context, id int64, req *model.
 	if req.BaseURL != nil {
 		p.BaseURL = *req.BaseURL
 	}
-	// 约定：api_key 留空/未传 = 不修改（前端表单不回显密钥）
+	// An omitted or empty key preserves the existing credential.
 	if req.APIKey != nil && *req.APIKey != "" {
 		enc, err := s.encryptor.Encrypt(*req.APIKey)
 		if err != nil {
@@ -115,20 +116,19 @@ func (s *ModelService) UpdateProvider(ctx context.Context, id int64, req *model.
 	return s.repos.LLM.UpdateProvider(ctx, p)
 }
 
-// DeleteProvider 删除供应商。
+// DeleteProvider delegates removal; dependency constraints are enforced by PostgreSQL.
 func (s *ModelService) DeleteProvider(ctx context.Context, id int64) error {
 	return s.repos.LLM.DeleteProvider(ctx, id)
 }
 
-// ---- 模型配置 CRUD ----
-
-// ListModels 模型列表。
+// ListModels returns persisted models and their associated provider, optionally filtered by type.
 func (s *ModelService) ListModels(ctx context.Context, typ string) ([]model.ModelConfig, error) {
 	return s.repos.LLM.ListModels(ctx, typ)
 }
 
-// ListChatModels 对话模型选择列表（对话页下拉用，普通用户可访问）。
-// 只返回"模型与供应商均已启用"的 chat 模型，字段精简到选择器所需。
+// ListChatModels returns only enabled chat models with enabled providers.
+// The selector view includes labels and provider names without provider secrets;
+// an empty alias falls back to the upstream model name.
 func (s *ModelService) ListChatModels(ctx context.Context) ([]ChatModelItem, error) {
 	all, err := s.repos.LLM.ListModels(ctx, modelTypeChat)
 	if err != nil {
@@ -138,7 +138,11 @@ func (s *ModelService) ListChatModels(ctx context.Context) ([]ChatModelItem, err
 	for i := range all {
 		m := &all[i]
 		if m.Status != 1 || m.Provider == nil || m.Provider.Status != 1 {
-			continue // 停用的模型/供应商不出现在选择器
+			continue
+		}
+		key, err := s.encryptor.Decrypt(m.Provider.APIKey)
+		if err != nil || (key == "" && m.Provider.Code != "ollama") {
+			continue
 		}
 		label := m.Alias
 		if label == "" {
@@ -152,16 +156,18 @@ func (s *ModelService) ListChatModels(ctx context.Context) ([]ChatModelItem, err
 	return out, nil
 }
 
-// ChatModelItem 对话页模型选择器条目。
+// ChatModelItem is the reduced model view consumed by the chat model selector.
 type ChatModelItem struct {
 	ID        int64  `json:"id"`
-	Label     string `json:"label"`      // 展示名（alias 优先）
-	ModelName string `json:"model_name"` // 上游模型名
-	Provider  string `json:"provider"`   // 供应商展示名
+	Label     string `json:"label"`
+	ModelName string `json:"model_name"`
+	Provider  string `json:"provider"`
 	IsDefault bool   `json:"is_default"`
 }
 
-// CreateModel 创建模型配置（类型等关键字段必填，其余取默认值）。
+// CreateModel requires a provider, upstream name, and type, then applies defaults.
+// Optional pointer fields override those defaults even when their value is zero;
+// capabilities are normalized to a JSON array before insertion.
 func (s *ModelService) CreateModel(ctx context.Context, req *model.ModelUpsert) error {
 	if req.ProviderID == nil || req.ModelName == nil || req.Type == nil {
 		return errcode.ErrMissingParam
@@ -201,7 +207,7 @@ func (s *ModelService) CreateModel(ctx context.Context, req *model.ModelUpsert) 
 	return s.repos.LLM.CreateModel(ctx, m)
 }
 
-// UpdateModel 更新模型配置（读-改-写合并，语义同 UpdateProvider）。
+// UpdateModel merges supplied configuration fields into the loaded model, preserving omitted values.
 func (s *ModelService) UpdateModel(ctx context.Context, id int64, req *model.ModelUpsert) error {
 	m, err := s.repos.LLM.GetModel(ctx, id)
 	if err != nil {
@@ -246,13 +252,12 @@ func (s *ModelService) UpdateModel(ctx context.Context, id int64, req *model.Mod
 	return s.repos.LLM.UpdateModel(ctx, m)
 }
 
-// DeleteModel 删除模型配置。
+// DeleteModel delegates deletion of the identified model configuration.
 func (s *ModelService) DeleteModel(ctx context.Context, id int64) error {
 	return s.repos.LLM.DeleteModel(ctx, id)
 }
 
-// ---- 请求体辅助（nil 解引用默认值） ----
-
+// derefStr supplies an empty default for omitted string fields during creation.
 func derefStr(p *string) string {
 	if p == nil {
 		return ""
@@ -260,6 +265,7 @@ func derefStr(p *string) string {
 	return *p
 }
 
+// derefCaps preserves nil for omitted capability lists so creation can normalize them consistently.
 func derefCaps(p *[]string) []string {
 	if p == nil {
 		return nil
@@ -267,23 +273,21 @@ func derefCaps(p *[]string) []string {
 	return *p
 }
 
-// ---- 描述符解析 ----
-
-// ResolveModel 把 model_config_id 解析为运行时描述符（每次实时查库+解密，
-// 保证管理页改配置后无需重启即生效；返回值为本请求独享，可安全修改采样参数）。
-// fallbackID 为 Agent 配置的备用模型（0 表示无备用）。
+// ResolveModel builds request-local primary and optional fallback descriptors.
+// ID zero uses the platform chat default and does not resolve a fallback. A
+// primary lookup/decryption failure is fatal; an unavailable fallback is ignored
+// so a valid primary remains usable.
 func (s *Services) ResolveModel(ctx context.Context, modelConfigID, fallbackID int64) (*llm.ModelDescriptor, *llm.ModelDescriptor, error) {
 	if modelConfigID == 0 {
 		if d := s.DefaultChat(); d != nil {
 			return d, nil, nil
 		}
-		return nil, nil, errcode.ErrProviderNotFound.WithMsg("默认对话模型尚未配置")
+		return nil, nil, errcode.ErrProviderNotFound.WithMsg("No default chat model is configured")
 	}
 	m, err := s.Deps.Repos.LLM.GetModel(ctx, modelConfigID)
 	if err != nil {
 		return nil, nil, errcode.ErrProviderNotFound.WithCause(err)
 	}
-	// 采样参数以模型配置为准（Agent 级覆盖在 ChatService 组装时完成）
 	primary, err := s.descriptorOf(m, 0, 0)
 	if err != nil {
 		return nil, nil, err
@@ -298,24 +302,34 @@ func (s *Services) ResolveModel(ctx context.Context, modelConfigID, fallbackID i
 	return primary, fallback, nil
 }
 
-// resolveByName 按别名解析（alias → 配置 → 描述符）。
+// resolveByName resolves a configured alias with repository default-selection fallback.
+// It uses a background context because default-model callbacks have no request
+// context parameter, then decrypts the selected provider credentials.
 func (s *Services) resolveByName(alias, typ string) (*llm.ModelDescriptor, error) {
 	m, err := s.Deps.Repos.LLM.DefaultModel(context.Background(), alias, typ)
 	if err != nil {
-		return nil, errcode.ErrProviderNotFound.WithMsg("默认模型 %q 未配置", alias).WithCause(err)
+		return nil, errcode.ErrProviderNotFound.WithMsg("Default model %q is not configured", alias).WithCause(err)
 	}
 	return s.descriptorOf(m, 0, 0)
 }
 
-// descriptorOf 单条配置 → 描述符（解密 api_key）。
-// temp/topP ≤0 时取模型配置缺省（0.7/0.9）。
+// descriptorOf requires a preloaded enabled provider and enabled model.
+// It decrypts the stored key and rejects keyless cloud configurations while
+// allowing keyless Ollama. The resulting descriptor uses sampling defaults
+// 0.7/0.9 for nonpositive inputs; chat can then apply agent-specific overrides.
 func (s *Services) descriptorOf(m *model.ModelConfig, temp, topP float32) (*llm.ModelDescriptor, error) {
 	if m.Provider == nil {
-		return nil, errcode.ErrProviderNotFound.WithMsg("模型 %q 未关联供应商", m.Alias)
+		return nil, errcode.ErrProviderNotFound.WithMsg("Model %q has no associated provider", m.Alias)
+	}
+	if m.Status != 1 || m.Provider.Status != 1 {
+		return nil, errcode.ErrProviderNotFound.WithMsg("The model or its provider is disabled")
 	}
 	apiKey, err := s.Deps.Encryptor.Decrypt(m.Provider.APIKey)
 	if err != nil {
 		return nil, errcode.ErrInternal.WithCause(err)
+	}
+	if apiKey == "" && m.Provider.Code != "ollama" {
+		return nil, errcode.ErrProviderNotFound.WithMsg("Provider %q has no API key configured", m.Provider.Name)
 	}
 	if temp <= 0 {
 		temp = 0.7

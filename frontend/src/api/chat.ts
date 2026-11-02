@@ -1,25 +1,27 @@
 /**
- * 对话与会话接口 —— 对应 router.go 对话分组。
+ * REST access to chat models, sessions, and persisted message history.
+ * The streaming request itself lives in lib/sse.ts. These endpoints are also
+ * used after a stream ends to reconcile optimistic state with stored records.
  */
 import { http } from '@/lib/request';
 import type { Paged, PageQuery } from '@/types/api';
 import type { ChatModelItem, Message, Session } from '@/types/chat';
 
-/** 对话模型选择列表（GET /models，对话页下拉用） */
+/** Load enabled chat-model choices for the per-request override selector. */
 export const listChatModels = () => http.get<ChatModelItem[]>('/models');
 
-/** 会话列表 */
+/** Fetch paged session summaries, including titles, counts, and timestamps. */
 export const listSessions = (q?: PageQuery) =>
   http.get<Paged<Session>>('/sessions', q);
 
-/** 会话消息历史（含 metadata.agent_trace 决策链） */
+/** Load persisted message history, including reasoning, references, and agent_trace metadata. */
 export const listMessages = (sessionId: string) =>
   http.get<Message[]>(`/sessions/${sessionId}/messages`);
 
-/** 会话改名 */
+/** Change the session title; the store patches the visible summary after success. */
 export const renameSession = (id: string, title: string) =>
   http.put(`/sessions/${id}`, { title });
 
-/** 删除会话 */
+/** Delete a session and its message history through the backend ownership checks. */
 export const deleteSession = (id: string) =>
   http.delete(`/sessions/${id}`);

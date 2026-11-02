@@ -1,12 +1,11 @@
 /**
- * 模型网关管理页 —— 「模型供应商」与「模型配置」两个区块上下排列。
- *
- * 职责：
- * 1. 供应商 CRUD：API Key 由服务端 AES-GCM 加密存储、不回显，编辑时留空表示不修改；
- * 2. 模型配置 CRUD：类型（chat/embedding/rerank）、上下文窗口、输入/输出计价、
- *    故障转移优先级、能力位（vision/function_call/reasoning）与默认模型标记；
- * 3. 挂载时并行拉取供应商与模型列表，任一写操作成功后整体刷新，保证两区数据一致。
+ * Provider and model configuration management using separate create/edit
+ * drafts. API keys are write-only: an edit form starts with an empty secret and
+ * only submits a replacement when entered. Provider/model catalogs load together
+ * and refresh after mutations so labels, defaults, and ownership stay consistent.
  */
+import '@/styles/management.css';
+import { Icon } from '@/components/ui/Icon';
 import { useEffect, useRef, useState } from 'react';
 import {
   createModel,
@@ -35,43 +34,50 @@ import { errMsg } from '@/lib/request';
 import { toast } from '@/stores/ui';
 import type { ModelConfig, ModelProvider, ModelType } from '@/types/admin';
 
-/* ---- 常量映射 ---- */
-
-/** 模型类型 → 徽标色调：chat 主色 / embedding 青色 / rerank 紫色 */
+/**
+ * Presentation tones and labels follow model type rather than provider,
+ * so all models in the same role remain visually comparable.
+ */
 const TYPE_TONE: Record<ModelType, 'lime' | 'teal' | 'violet'> = {
   chat: 'lime',
   embedding: 'teal',
   rerank: 'violet',
 };
 
-/** 模型类型 → 中文展示 */
 const TYPE_LABEL: Record<ModelType, string> = {
-  chat: '对话',
-  embedding: '向量',
-  rerank: '重排',
+  chat: 'Chat',
+  embedding: 'Embedding',
+  rerank: 'Reranking',
 };
 
-/** 能力位选项（对应后端 capabilities 数组元素） */
+/**
+ * Capability identifiers match backend metadata; these checkboxes store
+ * labels rather than detecting support from a remote provider.
+ */
 const CAP_DEFS: { key: string; label: string }[] = [
-  { key: 'vision', label: '视觉理解' },
-  { key: 'function_call', label: '函数调用' },
-  { key: 'reasoning', label: '深度推理' },
+  { key: 'vision', label: 'Vision' },
+  { key: 'function_call', label: 'Function calling' },
+  { key: 'reasoning', label: 'Reasoning' },
 ];
 
-/** 数字输入统一转换：非法输入归 0，避免 NaN 传给后端 */
+/**
+ * Normalize numeric form changes to finite values before placing them in
+ * the model draft, preventing NaN from entering a JSON payload.
+ */
 const toNum = (v: string): number => {
   const n = Number(v);
   return Number.isFinite(n) ? n : 0;
 };
 
-/** 数字状态 → 启停徽标（约定 1 = 启用） */
+/** Backend status 1 means enabled; other numeric values display as disabled. */
 function EnabledBadge({ status }: { status: number }) {
-  return status === 1 ? <Badge tone="lime">启用</Badge> : <Badge tone="gray">停用</Badge>;
+  return status === 1 ? <Badge tone="lime">Enabled</Badge> : <Badge tone="gray">Disabled</Badge>;
 }
 
-/* ---- 表单草稿类型 ---- */
-
-/** 供应商表单草稿；api_key 仅在填写时随请求提交 */
+/**
+ * Editable provider fields with a boolean switch and a plaintext replacement
+ * key that is never populated from the masked response.
+ */
 interface ProviderDraft {
   code: string;
   name: string;
@@ -88,7 +94,10 @@ const EMPTY_PROVIDER: ProviderDraft = {
   status: true,
 };
 
-/** 模型表单草稿；provider_id 用字符串承载 Select 值，提交时转数字 */
+/**
+ * Model draft with string provider selection and numeric limits/prices.
+ * The selection is converted to a numeric ID only when submitting.
+ */
 interface ModelDraft {
   provider_id: string;
   model_name: string;
@@ -120,24 +129,22 @@ const EMPTY_MODEL: ModelDraft = {
 };
 
 export function ModelsAdminPage() {
-  /* ---- 列表数据与全局状态 ---- */
   const [providers, setProviders] = useState<ModelProvider[]>([]);
   const [models, setModels] = useState<ModelConfig[]>([]);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [deleting, setDeleting] = useState(false);
 
-  /* ---- 供应商表单 ---- */
+  /** Provider and model editors keep independent targets and drafts. */
   const [providerOpen, setProviderOpen] = useState(false);
   const [editingProvider, setEditingProvider] = useState<ModelProvider | null>(null);
   const [providerDraft, setProviderDraft] = useState<ProviderDraft>(EMPTY_PROVIDER);
 
-  /* ---- 模型表单 ---- */
   const [modelOpen, setModelOpen] = useState(false);
   const [editingModel, setEditingModel] = useState<ModelConfig | null>(null);
   const [modelDraft, setModelDraft] = useState<ModelDraft>(EMPTY_MODEL);
 
-  /** 删除目标：kind 区分区块，label 用于确认文案 */
+  /** Resource kind lets one confirmation dialog dispatch to the correct endpoint. */
   const [delTarget, setDelTarget] = useState<{
     kind: 'provider' | 'model';
     id: number;
@@ -146,9 +153,10 @@ export function ModelsAdminPage() {
 
   const rootRef = useRef<HTMLDivElement>(null);
 
-  /* ---- 数据加载 ---- */
-
-  /** 并行拉取供应商 + 模型；写操作成功后复用整体刷新 */
+  /**
+   * Load providers and models concurrently so the relation table and provider
+   * selector use one refreshed catalog after each mutation.
+   */
   const load = async () => {
     setLoading(true);
     try {
@@ -166,7 +174,10 @@ export function ModelsAdminPage() {
     void load();
   }, []);
 
-  /** 首屏数据就绪后两个区块交错入场（仅首次，后续刷新不重播） */
+  /**
+   * Play section entry motion only after the first completed load, avoiding
+   * a repeated page entrance after every save or health-independent refresh.
+   */
   const playedRef = useRef(false);
   useEffect(() => {
     if (loading || playedRef.current) return;
@@ -175,15 +186,15 @@ export function ModelsAdminPage() {
     if (sections && sections.length > 0) staggerEnter(Array.from(sections));
   }, [loading]);
 
-  /* ---- 表单辅助 ---- */
-
+  /** Merge draft changes without modifying the provider catalog record. */
   const patchProvider = (patch: Partial<ProviderDraft>) =>
     setProviderDraft((d) => ({ ...d, ...patch }));
 
+  /** Merge draft changes without replacing unrelated model fields. */
   const patchModel = (patch: Partial<ModelDraft>) =>
     setModelDraft((d) => ({ ...d, ...patch }));
 
-  /** 切换能力位勾选状态 */
+  /** Add/remove the capability label once while preserving other selected labels. */
   const toggleCap = (key: string) => {
     setModelDraft((d) => ({
       ...d,
@@ -193,17 +204,20 @@ export function ModelsAdminPage() {
     }));
   };
 
-  /* ---- 供应商：新增 / 编辑 ---- */
-
+  /** Reset provider fields and secret input for a new resource. */
   const openProviderCreate = () => {
     setEditingProvider(null);
     setProviderDraft(EMPTY_PROVIDER);
     setProviderOpen(true);
   };
 
+  /**
+   * Prefill public provider fields while leaving the secret blank. A masked
+   * summary is never submitted as if it were a real API key.
+   */
   const openProviderEdit = (p: ModelProvider) => {
     setEditingProvider(p);
-    // api_key 加密存储不回显，留空提交表示不修改
+    // An empty key preserves the stored secret.
     setProviderDraft({
       code: p.code,
       name: p.name,
@@ -214,30 +228,35 @@ export function ModelsAdminPage() {
     setProviderOpen(true);
   };
 
+  /**
+   * Validate required endpoint identity fields and explicitly serialize status
+   * as 1 or 0. Only a newly entered secret is included, preserving an existing
+   * key on edits that change other provider settings.
+   */
   const submitProvider = async () => {
     if (!providerDraft.code.trim() || !providerDraft.name.trim() || !providerDraft.base_url.trim()) {
-      toast.err('code、名称、Base URL 均为必填项');
+      toast.err('Code, name, and Base URL are required');
       return;
     }
     setSaving(true);
     try {
-      // status 显式提交（1=启用 / 0=停用），配合后端局部更新语义
+      // Send zero explicitly to disable the provider.
       const base = {
         code: providerDraft.code.trim(),
         name: providerDraft.name.trim(),
         base_url: providerDraft.base_url.trim(),
         status: providerDraft.status ? 1 : 0,
       };
-      // api_key 仅在填写时提交（服务端 AES-GCM 加密存储）
+      // Only send a replacement key when one was entered.
       const payload = providerDraft.api_key.trim()
         ? { ...base, api_key: providerDraft.api_key.trim() }
         : base;
       if (editingProvider) {
         await updateProvider(editingProvider.id, payload);
-        toast.ok('供应商已更新');
+        toast.ok('Provider updated');
       } else {
         await createProvider(payload);
-        toast.ok('供应商已创建');
+        toast.ok('Provider created');
       }
       setProviderOpen(false);
       await load();
@@ -248,14 +267,17 @@ export function ModelsAdminPage() {
     }
   };
 
-  /* ---- 模型：新增 / 编辑 ---- */
-
+  /** Reset model-specific limits, prices, and capability flags to local defaults. */
   const openModelCreate = () => {
     setEditingModel(null);
     setModelDraft(EMPTY_MODEL);
     setModelOpen(true);
   };
 
+  /**
+   * Copy the persisted model into the draft, converting provider ID for Select
+   * and normalizing an absent capabilities array.
+   */
   const openModelEdit = (m: ModelConfig) => {
     setEditingModel(m);
     setModelDraft({
@@ -275,13 +297,17 @@ export function ModelsAdminPage() {
     setModelOpen(true);
   };
 
+  /**
+   * Require a model name and provider, serialize the full editable draft, then
+   * refresh both catalogs so aliases, defaults, and provider labels stay current.
+   */
   const submitModel = async () => {
     if (!modelDraft.model_name.trim()) {
-      toast.err('模型名称为必填项');
+      toast.err('Model name is required');
       return;
     }
     if (!modelDraft.provider_id) {
-      toast.err('请选择所属供应商');
+      toast.err('Please select a provider');
       return;
     }
     setSaving(true);
@@ -302,10 +328,10 @@ export function ModelsAdminPage() {
       };
       if (editingModel) {
         await updateModel(editingModel.id, payload);
-        toast.ok('模型已更新');
+        toast.ok('Model updated');
       } else {
         await createModel(payload);
-        toast.ok('模型已创建');
+        toast.ok('Model created');
       }
       setModelOpen(false);
       await load();
@@ -316,15 +342,17 @@ export function ModelsAdminPage() {
     }
   };
 
-  /* ---- 删除 ---- */
-
+  /**
+   * Dispatch the shared confirmation target by resource kind. Server dependency
+   * checks remain authoritative, and failure leaves the target available to review.
+   */
   const confirmDelete = async () => {
     if (!delTarget) return;
     setDeleting(true);
     try {
       if (delTarget.kind === 'provider') await deleteProvider(delTarget.id);
       else await deleteModel(delTarget.id);
-      toast.ok('删除成功');
+      toast.ok('Deleted successfully');
       setDelTarget(null);
       await load();
     } catch (e) {
@@ -335,10 +363,10 @@ export function ModelsAdminPage() {
   };
 
   return (
-    <div ref={rootRef} className="page-container">
+    <div ref={rootRef} className="page-container management-page">
       <PageHeader
-        title="模型网关"
-        desc="管理上游模型供应商与模型配置；API Key 由服务端 AES-GCM 加密存储，仅回显打码摘要（前2位+****+后4位）"
+        title="Model gateway"
+        desc="Manage model providers and configurations. API keys are encrypted on the server and displayed as masked previews."
       />
 
       {loading ? (
@@ -347,38 +375,38 @@ export function ModelsAdminPage() {
         </div>
       ) : (
         <div className="space-y-6">
-          {/* 区块一：模型供应商 */}
           <section className="panel overflow-hidden">
-            <div className="flex items-center justify-between border-b border-smoke/60 px-4 py-3">
-              <h2 className="section-title">模型供应商</h2>
-              <Button onClick={openProviderCreate}>＋ 新增供应商</Button>
+            <div className="management-section-header flex flex-wrap items-center justify-between gap-3 border-b border-smoke/70 px-5 py-4">
+              <h2 className="section-title">Model providers</h2>
+              <Button onClick={openProviderCreate}>＋ Add provider</Button>
             </div>
             {providers.length === 0 ? (
               <EmptyState
-                title="暂无供应商"
-                hint="先接入一家模型供应商（如 deepseek / qwen），再配置具体模型"
-                action={<Button onClick={openProviderCreate}>新增供应商</Button>}
+                icon={<Icon name="models" className="h-6 w-6" />}
+                title="No providers yet"
+                hint="Connect OpenAI, Gemini, or DeepSeek, then add your models."
+                action={<Button onClick={openProviderCreate}>Add provider</Button>}
               />
             ) : (
               <div className="overflow-x-auto">
-                <table className="w-full text-left text-sm">
+                <table className="management-table w-full min-w-[800px] text-left text-sm">
                   <thead>
-                    <tr className="border-b border-smoke/60 text-xs text-ash">
-                      <th className="px-4 py-2.5 font-medium">Code</th>
-                      <th className="px-4 py-2.5 font-medium">名称</th>
-                      <th className="px-4 py-2.5 font-medium">Base URL</th>
-                      <th className="px-4 py-2.5 font-medium">API Key</th>
-                      <th className="px-4 py-2.5 font-medium">状态</th>
-                      <th className="px-4 py-2.5 font-medium">更新时间</th>
-                      <th className="px-4 py-2.5 text-right font-medium">操作</th>
+                    <tr className="border-b border-smoke bg-graphite/70 text-xs text-fog">
+                      <th className="px-4 py-3.5 font-medium">Code</th>
+                      <th className="px-4 py-3.5 font-medium">Name</th>
+                      <th className="px-4 py-3.5 font-medium">Base URL</th>
+                      <th className="px-4 py-3.5 font-medium">API Key</th>
+                      <th className="px-4 py-3.5 font-medium">Status</th>
+                      <th className="px-4 py-3.5 font-medium">Updated</th>
+                      <th className="px-4 py-3.5 text-right font-medium">Actions</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-smoke/40">
                     {providers.map((p) => (
-                      <tr key={p.id} className="transition-colors hover:bg-graphite/40">
-                        <td className="px-4 py-2.5 font-mono text-lime">{p.code}</td>
-                        <td className="px-4 py-2.5 text-bone">{p.name}</td>
-                        <td className="px-4 py-2.5">
+                      <tr key={p.id} className="transition-colors hover:bg-graphite/60">
+                        <td className="px-4 py-3.5 font-mono text-lime">{p.code}</td>
+                        <td className="px-4 py-3.5 text-bone">{p.name}</td>
+                        <td className="px-4 py-3.5">
                           <span
                             className="block max-w-[240px] truncate font-mono text-xs text-fog"
                             title={p.base_url}
@@ -386,31 +414,31 @@ export function ModelsAdminPage() {
                             {p.base_url}
                           </span>
                         </td>
-                        <td className="px-4 py-2.5">
+                        <td className="px-4 py-3.5">
                           {p.api_key_masked ? (
                             <span
                               className="font-mono text-xs text-fog"
-                              title="已配置（加密存储，仅展示打码摘要）"
+                              title="Configured (encrypted; only a masked preview is shown)"
                             >
                               {p.api_key_masked}
                             </span>
                           ) : (
-                            <Badge tone="gray">未配置</Badge>
+                            <Badge tone="gray">Not configured</Badge>
                           )}
                         </td>
-                        <td className="px-4 py-2.5">
+                        <td className="px-4 py-3.5">
                           <EnabledBadge status={p.status} />
                         </td>
-                        <td className="px-4 py-2.5 text-xs text-fog">
+                        <td className="px-4 py-3.5 text-xs text-fog">
                           {relativeTime(p.updated_at) || '—'}
                         </td>
-                        <td className="px-4 py-2.5">
+                        <td className="px-4 py-3.5">
                           <div className="flex justify-end gap-3 text-xs">
                             <button
                               className="text-ash transition-colors hover:text-lime"
                               onClick={() => openProviderEdit(p)}
                             >
-                              编辑
+                              Edit
                             </button>
                             <button
                               className="text-ash transition-colors hover:text-coral"
@@ -418,7 +446,7 @@ export function ModelsAdminPage() {
                                 setDelTarget({ kind: 'provider', id: p.id, label: p.name })
                               }
                             >
-                              删除
+                              Delete
                             </button>
                           </div>
                         </td>
@@ -430,64 +458,64 @@ export function ModelsAdminPage() {
             )}
           </section>
 
-          {/* 区块二：模型配置 */}
           <section className="panel overflow-hidden">
-            <div className="flex items-center justify-between border-b border-smoke/60 px-4 py-3">
-              <h2 className="section-title">模型配置</h2>
-              <Button onClick={openModelCreate}>＋ 新增模型</Button>
+            <div className="management-section-header flex flex-wrap items-center justify-between gap-3 border-b border-smoke/70 px-5 py-4">
+              <h2 className="section-title">Model configurations</h2>
+              <Button onClick={openModelCreate}>＋ Add model</Button>
             </div>
             {models.length === 0 ? (
               <EmptyState
-                title="暂无模型配置"
-                hint={providers.length === 0 ? '请先添加供应商，再为平台注册可用模型' : '为平台注册可用的对话 / 向量 / 重排模型'}
-                action={<Button onClick={openModelCreate}>新增模型</Button>}
+                icon={<Icon name="models" className="h-6 w-6" />}
+                title="No model configurations yet"
+                hint={providers.length === 0 ? 'Add a provider first, then register its models.' : 'Register chat, embedding, or reranking models.'}
+                action={<Button onClick={openModelCreate}>Add model</Button>}
               />
             ) : (
               <div className="overflow-x-auto">
-                <table className="w-full text-left text-sm">
+                <table className="management-table w-full min-w-[800px] text-left text-sm">
                   <thead>
-                    <tr className="border-b border-smoke/60 text-xs text-ash">
-                      <th className="px-4 py-2.5 font-medium">别名</th>
-                      <th className="px-4 py-2.5 font-medium">模型名称</th>
-                      <th className="px-4 py-2.5 font-medium">类型</th>
-                      <th className="px-4 py-2.5 font-medium">供应商</th>
-                      <th className="px-4 py-2.5 font-medium">上下文窗口</th>
-                      <th className="px-4 py-2.5 font-medium">输入价(元/1M)</th>
-                      <th className="px-4 py-2.5 font-medium">输出价(元/1M)</th>
-                      <th className="px-4 py-2.5 font-medium">优先级</th>
-                      <th className="px-4 py-2.5 font-medium">默认</th>
-                      <th className="px-4 py-2.5 font-medium">状态</th>
-                      <th className="px-4 py-2.5 text-right font-medium">操作</th>
+                    <tr className="border-b border-smoke bg-graphite/70 text-xs text-fog">
+                      <th className="px-4 py-3.5 font-medium">Alias</th>
+                      <th className="px-4 py-3.5 font-medium">Model name</th>
+                      <th className="px-4 py-3.5 font-medium">Type</th>
+                      <th className="px-4 py-3.5 font-medium">Provider</th>
+                      <th className="px-4 py-3.5 font-medium">Context window</th>
+                      <th className="px-4 py-3.5 font-medium">Input (CNY/1M)</th>
+                      <th className="px-4 py-3.5 font-medium">Output (CNY/1M)</th>
+                      <th className="px-4 py-3.5 font-medium">Priority</th>
+                      <th className="px-4 py-3.5 font-medium">Default</th>
+                      <th className="px-4 py-3.5 font-medium">Status</th>
+                      <th className="px-4 py-3.5 text-right font-medium">Actions</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-smoke/40">
                     {models.map((m) => (
-                      <tr key={m.id} className="transition-colors hover:bg-graphite/40">
-                        <td className="px-4 py-2.5 text-bone">{m.alias || '—'}</td>
-                        <td className="px-4 py-2.5 font-mono text-xs text-mist">{m.model_name}</td>
-                        <td className="px-4 py-2.5">
+                      <tr key={m.id} className="transition-colors hover:bg-graphite/60">
+                        <td className="px-4 py-3.5 text-bone">{m.alias || '—'}</td>
+                        <td className="px-4 py-3.5 font-mono text-xs text-mist">{m.model_name}</td>
+                        <td className="px-4 py-3.5">
                           <Badge tone={TYPE_TONE[m.type] ?? 'gray'}>
                             {TYPE_LABEL[m.type] ?? m.type}
                           </Badge>
                         </td>
-                        <td className="px-4 py-2.5 text-fog">{m.provider?.name ?? '—'}</td>
-                        <td className="px-4 py-2.5 font-mono text-xs text-fog">{m.context_window}</td>
-                        <td className="px-4 py-2.5 font-mono text-xs text-fog">{m.input_price}</td>
-                        <td className="px-4 py-2.5 font-mono text-xs text-fog">{m.output_price}</td>
-                        <td className="px-4 py-2.5 font-mono text-xs text-fog">{m.priority}</td>
-                        <td className="px-4 py-2.5">
-                          {m.is_default ? <Badge tone="lime">默认</Badge> : <span className="text-xs text-ash">—</span>}
+                        <td className="px-4 py-3.5 text-fog">{m.provider?.name ?? '—'}</td>
+                        <td className="px-4 py-3.5 font-mono text-xs text-fog">{m.context_window}</td>
+                        <td className="px-4 py-3.5 font-mono text-xs text-fog">{m.input_price}</td>
+                        <td className="px-4 py-3.5 font-mono text-xs text-fog">{m.output_price}</td>
+                        <td className="px-4 py-3.5 font-mono text-xs text-fog">{m.priority}</td>
+                        <td className="px-4 py-3.5">
+                          {m.is_default ? <Badge tone="lime">Default</Badge> : <span className="text-xs text-ash">—</span>}
                         </td>
-                        <td className="px-4 py-2.5">
+                        <td className="px-4 py-3.5">
                           <EnabledBadge status={m.status} />
                         </td>
-                        <td className="px-4 py-2.5">
+                        <td className="px-4 py-3.5">
                           <div className="flex justify-end gap-3 text-xs">
                             <button
                               className="text-ash transition-colors hover:text-lime"
                               onClick={() => openModelEdit(m)}
                             >
-                              编辑
+                              Edit
                             </button>
                             <button
                               className="text-ash transition-colors hover:text-coral"
@@ -495,7 +523,7 @@ export function ModelsAdminPage() {
                                 setDelTarget({ kind: 'model', id: m.id, label: m.alias || m.model_name })
                               }
                             >
-                              删除
+                              Delete
                             </button>
                           </div>
                         </td>
@@ -509,37 +537,36 @@ export function ModelsAdminPage() {
         </div>
       )}
 
-      {/* 新增 / 编辑供应商 */}
       <Modal
         open={providerOpen}
-        title={editingProvider ? '编辑供应商' : '新增供应商'}
+        title={editingProvider ? 'Edit provider' : 'Add provider'}
         onClose={() => setProviderOpen(false)}
         footer={
           <>
             <Button variant="ghost" onClick={() => setProviderOpen(false)}>
-              取消
+              Cancel
             </Button>
             <Button loading={saving} onClick={() => void submitProvider()}>
-              保存
+              Save
             </Button>
           </>
         }
       >
         <div className="space-y-3">
-          <div className="grid grid-cols-2 gap-3">
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
             <div>
-              <label className="field-label">Code（唯一标识）</label>
+              <label className="field-label">Code (unique identifier)</label>
               <Input
                 value={providerDraft.code}
-                placeholder="如 deepseek"
+                placeholder="e.g. deepseek"
                 onChange={(e) => patchProvider({ code: e.target.value })}
               />
             </div>
             <div>
-              <label className="field-label">名称</label>
+              <label className="field-label">Name</label>
               <Input
                 value={providerDraft.name}
-                placeholder="如 DeepSeek"
+                placeholder="e.g. DeepSeek"
                 onChange={(e) => patchProvider({ name: e.target.value })}
               />
             </div>
@@ -548,18 +575,17 @@ export function ModelsAdminPage() {
             <label className="field-label">Base URL</label>
             <Input
               value={providerDraft.base_url}
-              placeholder="如 https://api.deepseek.com/v1"
+              placeholder="e.g. https://api.deepseek.com/v1"
               onChange={(e) => patchProvider({ base_url: e.target.value })}
             />
           </div>
           <div>
             <label className="field-label">API Key</label>
-            {/* AES-GCM 加密存储；编辑时留空表示不修改 */}
             <Input
               type="password"
               autoComplete="new-password"
               value={providerDraft.api_key}
-              placeholder={editingProvider ? '留空表示不修改' : 'sk-...'}
+              placeholder={editingProvider ? 'Leave blank to keep the current key' : 'sk-...'}
               onChange={(e) => patchProvider({ api_key: e.target.value })}
             />
           </div>
@@ -571,73 +597,72 @@ export function ModelsAdminPage() {
                 checked={providerDraft.status}
                 onChange={(e) => patchProvider({ status: e.target.checked })}
               />
-              启用该供应商（停用后其下模型不可用）
+              Enable provider (disabling it makes its models unavailable)
             </label>
           </div>
         </div>
       </Modal>
 
-      {/* 新增 / 编辑模型 */}
       <Modal
         open={modelOpen}
-        title={editingModel ? '编辑模型' : '新增模型'}
+        title={editingModel ? 'Edit model' : 'Add model'}
         onClose={() => setModelOpen(false)}
         width="max-w-2xl"
         footer={
           <>
             <Button variant="ghost" onClick={() => setModelOpen(false)}>
-              取消
+              Cancel
             </Button>
             <Button loading={saving} onClick={() => void submitModel()}>
-              保存
+              Save
             </Button>
           </>
         }
       >
-        <div className="grid grid-cols-2 gap-3">
-          <div className="col-span-2">
-            <label className="field-label">所属供应商</label>
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+          <div className="sm:col-span-2">
+            <label className="field-label">Provider</label>
             <Select
               value={modelDraft.provider_id}
               onChange={(e) => patchModel({ provider_id: e.target.value })}
             >
-              <option value="">请选择供应商</option>
+              <option value="">Select a provider</option>
               {providers.map((p) => (
                 <option key={p.id} value={String(p.id)}>
-                  {p.name}（{p.code}）
+                  {p.name} ({p.code})
                 </option>
               ))}
             </Select>
           </div>
           <div>
-            <label className="field-label">模型名称 *</label>
+            <label className="field-label">Model name *</label>
             <Input
               value={modelDraft.model_name}
-              placeholder="上游模型名，如 deepseek-chat"
+              placeholder="Provider model name, e.g. deepseek-chat"
               onChange={(e) => patchModel({ model_name: e.target.value })}
             />
           </div>
           <div>
-            <label className="field-label">平台别名</label>
+            <label className="field-label">Display alias</label>
             <Input
               value={modelDraft.alias}
-              placeholder="如 DeepSeek V3"
+              placeholder="e.g. DeepSeek V3"
               onChange={(e) => patchModel({ alias: e.target.value })}
             />
           </div>
           <div>
-            <label className="field-label">类型</label>
+            <label className="field-label">Type</label>
             <Select
               value={modelDraft.type}
               onChange={(e) => patchModel({ type: e.target.value as ModelType })}
             >
-              <option value="chat">对话（chat）</option>
-              <option value="embedding">向量（embedding）</option>
-              <option value="rerank">重排（rerank）</option>
+              <option value="chat">Chat</option>
+              <option value="embedding">Embedding</option>
+              <option value="rerank">Reranking</option>
             </Select>
           </div>
           <div>
-            <label className="field-label">优先级（小者优先）</label>
+            <label className="field-label">Priority (lower first)</label>
             <Input
               type="number"
               value={modelDraft.priority}
@@ -645,7 +670,7 @@ export function ModelsAdminPage() {
             />
           </div>
           <div>
-            <label className="field-label">上下文窗口</label>
+            <label className="field-label">Context window</label>
             <Input
               type="number"
               value={modelDraft.context_window}
@@ -653,7 +678,7 @@ export function ModelsAdminPage() {
             />
           </div>
           <div>
-            <label className="field-label">最大输出</label>
+            <label className="field-label">Maximum output tokens</label>
             <Input
               type="number"
               value={modelDraft.max_output}
@@ -661,7 +686,7 @@ export function ModelsAdminPage() {
             />
           </div>
           <div>
-            <label className="field-label">输入价（元/1M tokens）</label>
+            <label className="field-label">Input price (CNY/1M tokens)</label>
             <Input
               type="number"
               step="0.000001"
@@ -670,7 +695,7 @@ export function ModelsAdminPage() {
             />
           </div>
           <div>
-            <label className="field-label">输出价（元/1M tokens）</label>
+            <label className="field-label">Output price (CNY/1M tokens)</label>
             <Input
               type="number"
               step="0.000001"
@@ -678,8 +703,8 @@ export function ModelsAdminPage() {
               onChange={(e) => patchModel({ output_price: toNum(e.target.value) })}
             />
           </div>
-          <div className="col-span-2">
-            <label className="field-label">能力</label>
+          <div className="sm:col-span-2">
+            <label className="field-label">Capabilities</label>
             <div className="flex gap-5">
               {CAP_DEFS.map((cap) => (
                 <label key={cap.key} className="flex cursor-pointer items-center gap-1.5 text-sm text-mist">
@@ -694,7 +719,7 @@ export function ModelsAdminPage() {
               ))}
             </div>
           </div>
-          <div className="col-span-2">
+          <div className="sm:col-span-2">
             <label className="flex cursor-pointer items-center gap-2 text-sm text-mist">
               <input
                 type="checkbox"
@@ -702,10 +727,10 @@ export function ModelsAdminPage() {
                 checked={modelDraft.is_default}
                 onChange={(e) => patchModel({ is_default: e.target.checked })}
               />
-              设为默认模型
+              Set as default model
             </label>
           </div>
-          <div className="col-span-2">
+          <div className="sm:col-span-2">
             <label className="flex cursor-pointer items-center gap-2 text-sm text-mist">
               <input
                 type="checkbox"
@@ -713,25 +738,24 @@ export function ModelsAdminPage() {
                 checked={modelDraft.status}
                 onChange={(e) => patchModel({ status: e.target.checked })}
               />
-              启用该模型（停用后不会被解析为默认/备用模型）
+              Enable model (disabled models cannot be used as defaults or fallbacks)
             </label>
           </div>
         </div>
       </Modal>
 
-      {/* 删除二次确认 */}
       <ConfirmDialog
         open={delTarget !== null}
-        title={delTarget?.kind === 'provider' ? '删除供应商' : '删除模型'}
+        title={delTarget?.kind === 'provider' ? 'Delete provider' : 'Delete model'}
         content={
           delTarget
             ? delTarget.kind === 'provider'
-              ? `确认删除供应商「${delTarget.label}」？其下模型配置可能一并失效，该操作不可恢复。`
-              : `确认删除模型「${delTarget.label}」？该操作不可恢复。`
+              ? `Delete provider “${delTarget.label}”? Its model configurations may become unavailable. This cannot be undone.`
+              : `Delete model “${delTarget.label}”? This cannot be undone.`
             : ''
         }
         danger
-        confirmText="删除"
+        confirmText="Delete"
         loading={deleting}
         onCancel={() => setDelTarget(null)}
         onConfirm={() => void confirmDelete()}

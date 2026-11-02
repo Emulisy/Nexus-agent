@@ -1,21 +1,23 @@
 /**
- * 记忆接口 —— 对应 router.go 记忆分组。
+ * Long-term memory list, archive, deletion, and extraction operations.
+ * The page reloads its server-backed list after mutations instead of trying to
+ * predict extraction results or memory-ranking changes locally.
  */
 import { http } from '@/lib/request';
 import type { Paged, PageQuery } from '@/types/api';
 import type { ExtractMemoryReq, Memory } from '@/types/memory';
 
-/** 记忆列表（分页） */
+/** Fetch a page of user-visible long-term memories with scope and lifecycle status. */
 export const listMemories = (q?: PageQuery) =>
   http.get<Paged<Memory>>('/memories', q);
 
-/** 删除记忆 */
+/** Permanently remove a selected memory record. */
 export const deleteMemory = (id: number) => http.delete(`/memories/${id}`);
 
-/** 归档记忆（status 1 生效 → 2 归档） */
+/** Mark a memory archived so it is no longer treated as active retrieval context. */
 export const archiveMemory = (id: number) =>
   http.post(`/memories/${id}/archive`);
 
-/** 手动抽取："记住这次对话"（对指定会话跑长期记忆抽取） */
+/** Request long-term memory extraction for the specified accessible conversation. */
 export const extractMemory = (req: ExtractMemoryReq) =>
   http.post('/memories/extract', req);

@@ -1,4 +1,5 @@
--- 回滚初始表结构
+-- Reverse the initial schema in dependency order: remove child/audit tables before
+-- the users, resources, and model providers they reference. All table data is lost.
 DROP TABLE IF EXISTS sandbox_executions;
 DROP TABLE IF EXISTS usage_logs;
 DROP TABLE IF EXISTS feedbacks;

@@ -1,45 +1,42 @@
 /**
- * SSE 流式解析 —— POST /chat/stream 的字节流 → 事件回调。
- *
- * 为什么不用 EventSource：浏览器原生 EventSource 只支持 GET，
- * 而对话是 POST + JSON body，因此用 fetch + ReadableStream 手动解析。
- * 帧格式与 handler_chat.go writeSSE 完全对齐：
- *
- *   event: <type>\n
- *   data: <json>\n
- *   \n            ← 空行即帧边界
- *
- * 关键坑：TCP 分包可能把一帧劈成两半，必须缓冲半帧（split 后 pop 留尾）。
+ * Transport for POST-based chat event streams. EventSource cannot send the
+ * JSON request body, so fetch exposes a ReadableStream that is decoded manually.
+ * Frames follow the backend format: event: <name>, data: <JSON>, then a blank line.
+ * Partial UTF-8 sequences and partial frames survive across network reads.
+ * This transport reports errors through onEvent; it does not refresh tokens,
+ * reconnect, or replay the chat request automatically.
  */
-import type { SSEEventType } from '@/types/chat';
+import type { ChatReq, SSEEventType } from '@/types/chat';
 
+/**
+ * One parsed server frame. Payload interpretation belongs to the chat reducer,
+ * so this transport exposes a generic object rather than branching on event names.
+ */
 export interface SSEEvent {
   event: SSEEventType;
   data: Record<string, unknown>;
 }
 
+/**
+ * Control and completion signals for a single in-flight fetch.
+ * Aborting cancels the client request; it does not call a separate server stop API.
+ */
 export interface StreamHandle {
-  /** 中断流（用户点停止按钮） */
+  /** Cancel the underlying fetch/reader; server-side cleanup follows connection handling. */
   abort: () => void;
-  /** 流结束信号（done/error/中断/网络断 都会 resolve） */
+  /** Resolves after completion, failure, or cancellation. */
   done: Promise<void>;
 }
 
 /**
- * 发起流式对话并逐事件回调。
- *
- * @param body   对话请求 {session_id?, agent_id?, content, model_config_id?}
- * @param onEvent 每解析出一个完整帧回调一次
- * @param token  access token（SSE 无法走 401 重放逻辑，需显式传入；
- *               调用方保证 token 新鲜——进入聊天页时已由请求层刷新过）
+ * Start the background reader and return its cancellation/completion handle.
+ * The caller supplies the current access token; an HTTP 401 becomes an error
+ * event here, rather than entering the REST client token-refresh path.
+ * onEvent receives complete JSON frames. done always resolves, including failure
+ * and cancellation, so the store can reconcile persisted history in one place.
  */
 export async function runChatStream(
-  body: {
-    session_id?: string;
-    agent_id?: number;
-    content: string;
-    model_config_id?: number;
-  },
+  body: ChatReq,
   onEvent: (e: SSEEvent) => void,
   token: string,
 ): Promise<StreamHandle> {
@@ -49,7 +46,10 @@ export async function runChatStream(
     resolveDone = r;
   });
 
-  // 流处理主体：独立异步任务，结束/异常时都 resolve done
+  /**
+   * Keep the reader detached from handle creation so callers can stop a request
+   * while it is still waiting for headers. finally releases the store continuation.
+   */
   void (async () => {
     try {
       const res = await fetch('/api/v1/chat/stream', {
@@ -62,14 +62,17 @@ export async function runChatStream(
         signal: controller.signal,
       });
 
-      // 非 200：可能是 token 过期/无权限，读 JSON 包络抛给 UI
+      /**
+       * Translate an unsuccessful HTTP handshake into the same error-event path
+       * used by stream failures, preserving a backend message when available.
+       */
       if (res.status !== 200) {
-        let msg = `连接失败（HTTP ${res.status}）`;
+        let msg = `Connection failed (HTTP ${res.status})`;
         try {
           const env = await res.json();
           if (env?.message) msg = env.message;
         } catch {
-          /* body 不是 JSON，用默认文案 */
+          // Keep the HTTP error message when the response is not JSON.
         }
         onEvent({ event: 'error', data: { code: res.status, message: msg } });
         return;
@@ -78,7 +81,7 @@ export async function runChatStream(
       const reader = res.body!.getReader();
       const decoder = new TextDecoder();
       let buf = '';
-      // 终态事件（done/error）是否已送达：决定流结束后要不要补发"连接中断"
+      /** A named done/error frame distinguishes normal EOF from an interrupted stream. */
       let terminal = false;
 
       for (;;) {
@@ -86,12 +89,15 @@ export async function runChatStream(
         if (eof) break;
         buf += decoder.decode(value, { stream: true });
 
-        // 帧以空行分隔；最后一段可能是半帧，留到下一轮
+        // Keep the incomplete frame for the next read.
         const frames = buf.split('\n\n');
         buf = frames.pop() ?? '';
 
         for (const frame of frames) {
-          // 一个帧内 event: 与 data: 各一行（后端固定格式）
+          /**
+           * The backend emits one event line and one JSON data line per frame. This
+           * parser intentionally does not implement generic multiline/event-ID SSE features.
+           */
           const event = frame.match(/^event: (.+)$/m)?.[1] ?? '';
           const raw = frame.match(/^data: (.+)$/m)?.[1] ?? '{}';
           if (!event) continue;
@@ -102,25 +108,24 @@ export async function runChatStream(
               data: JSON.parse(raw) as Record<string, unknown>,
             });
           } catch {
-            // 单帧 JSON 损坏不影响整个流，跳过
+            // Ignore malformed frames without interrupting the stream.
           }
         }
       }
 
-      // 流结束但没等到 done/error 才算异常断开（此前无条件补发，
-      // 导致每次正常回答完也弹"连接中断，回答可能不完整"）
+      // EOF is unexpected unless a terminal event was received.
       if (!terminal) {
         onEvent({
           event: 'error',
-          data: { code: -1, message: '连接中断，回答可能不完整，请重发' },
+          data: { code: -1, message: 'Connection interrupted. The response may be incomplete; please send your message again.' },
         });
       }
     } catch (e) {
-      // 用户主动中断：不作为错误，静默结束（部分内容不落库，以服务端为准）
+      // Cancellation ends quietly; persisted messages remain authoritative.
       if (!(e instanceof DOMException && e.name === 'AbortError')) {
         onEvent({
           event: 'error',
-          data: { code: -1, message: '网络异常，请检查后端服务' },
+          data: { code: -1, message: 'Network error. Please check the backend service.' },
         });
       }
     } finally {

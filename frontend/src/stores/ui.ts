@@ -1,11 +1,13 @@
 /**
- * 全局 UI 状态：Toast 通知队列。
- * 不引第三方组件库 —— 轻量自实现，样式与设计系统一致。
+ * Global transient notifications shared by pages and request-driven actions.
+ * Monotonic IDs keep duplicate messages independently dismissible. Each toast
+ * expires after 3.2 seconds; ToastHost provides the visual presentation.
  */
 import { create } from 'zustand';
 
 export type ToastTone = 'ok' | 'err' | 'info';
 
+/** One queued notification; IDs distinguish identical messages and support dismissal. */
 export interface Toast {
   id: number;
   tone: ToastTone;
@@ -20,12 +22,15 @@ interface UIState {
 
 let seq = 0;
 
+/**
+ * Queue notifications independently of the routed page that produced them.
+ * Expiry removes by ID, so manual dismissal and timeout can safely overlap.
+ */
 export const useUI = create<UIState>((set) => ({
   toasts: [],
   push: (tone, message) => {
     const id = ++seq;
     set((s) => ({ toasts: [...s.toasts, { id, tone, message }] }));
-    // 3.2s 自动消失
     setTimeout(() => {
       set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) }));
     }, 3200);
@@ -33,7 +38,10 @@ export const useUI = create<UIState>((set) => ({
   remove: (id) => set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) })),
 }));
 
-/** 便捷函数：组件里直接 toast.ok('...') */
+/**
+ * Imperative helpers for components and store actions that do not need a hook
+ * subscription just to publish a notification.
+ */
 export const toast = {
   ok: (msg: string) => useUI.getState().push('ok', msg),
   err: (msg: string) => useUI.getState().push('err', msg),

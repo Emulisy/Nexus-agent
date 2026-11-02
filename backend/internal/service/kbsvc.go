@@ -1,11 +1,13 @@
-// 知识库服务：KB CRUD / 文档上传与 ETL 调度 / 检索测试台。
+// Knowledge-base services coordinate metadata, vector collections, and document jobs.
+// Ownership is checked through the parent knowledge base before document access.
+// Database, object-store, vector, and stream operations are separate writes;
+// failures after an earlier write can leave a partially completed operation.
 package service
 
 import (
 	"bytes"
 	"context"
 	"fmt"
-	"io"
 
 	"github.com/minio/minio-go/v7"
 
@@ -16,16 +18,16 @@ import (
 	"github.com/chengpeng-cp/nexus-agent/internal/pkg/pagination"
 )
 
-// MaxDocSize 文档上传大小上限（教学版 20MB）。
+// MaxDocSize bounds an uploaded document to 20 MiB before object storage or job publication.
 const MaxDocSize = 20 << 20
 
-// allowedDocTypes 允许的文档类型。
+// allowedDocTypes is the filename-extension allowlist applied to document uploads.
 var allowedDocTypes = map[string]bool{
 	".pdf": true, ".docx": true, ".md": true, ".markdown": true,
 	".txt": true, ".html": true, ".htm": true,
 }
 
-// KBService 知识库业务。
+// KBService shares RAG defaults and receives object storage separately after construction.
 type KBService struct {
 	svcs   *Services
 	cfg    *config.RAG
@@ -33,28 +35,30 @@ type KBService struct {
 	bucket string
 }
 
-// NewKBService 构造。
+// NewKBService binds the service container and the configured RAG chunk defaults.
 func NewKBService(svcs *Services) *KBService {
 	return &KBService{svcs: svcs, cfg: &svcs.Deps.Cfg.RAG}
 }
 
-// SetMinIO 注入对象存储（main 装配）。
+// SetMinIO attaches the object client and bucket used for uploaded document content.
 func (s *KBService) SetMinIO(cli *minio.Client, bucket string) {
 	s.minio = cli
 	s.bucket = bucket
 }
 
-// CreateKB 创建知识库（同步创建 Milvus 集合）。
+// CreateKB assigns ownership, resolves a missing embedding-model foreign key,
+// and fills nonpositive chunk settings from global defaults. It persists the KB
+// before deriving kb_<id>, then creates the vector collection if an engine is attached.
 func (s *KBService) CreateKB(ctx context.Context, userID int64, kb *model.KnowledgeBase) error {
 	if kb.Name == "" {
-		return errcode.ErrInvalidParam.WithMsg("name 不能为空")
+		return errcode.ErrInvalidParam.WithMsg("name is required")
 	}
 	kb.UserID = userID
-	// embedding_config_id 有非空外键：未显式指定时自动绑定默认向量化模型
+	// Resolve a default embedding model before inserting the non-null foreign key.
 	if kb.EmbeddingConfigID <= 0 {
 		m, err := s.svcs.Deps.Repos.LLM.DefaultModel(ctx, s.svcs.Deps.Cfg.LLM.DefaultEmbedding, modelTypeEmbed)
 		if err != nil {
-			return errcode.ErrInvalidParam.WithMsg("未找到可用的向量化模型配置，请先在模型管理中启用").WithCause(err)
+			return errcode.ErrInvalidParam.WithMsg("No embedding model is available. Enable one in model management first.").WithCause(err)
 		}
 		kb.EmbeddingConfigID = m.ID
 	}
@@ -67,7 +71,7 @@ func (s *KBService) CreateKB(ctx context.Context, userID int64, kb *model.Knowle
 	if err := s.svcs.Deps.Repos.KB.CreateKB(ctx, kb); err != nil {
 		return errcode.ErrInternal.WithCause(err)
 	}
-	// 集合名 = kb_{id}（依赖自增 ID，先落库再建集合）
+	// Persist first because the collection name depends on the generated ID.
 	kb.MilvusCollection = fmt.Sprintf("kb_%d", kb.ID)
 	if err := s.svcs.Deps.Repos.KB.UpdateKB(ctx, kb); err != nil {
 		return errcode.ErrInternal.WithCause(err)
@@ -80,12 +84,12 @@ func (s *KBService) CreateKB(ctx context.Context, userID int64, kb *model.Knowle
 	return nil
 }
 
-// ListKBs 知识库列表。
+// ListKBs delegates the current user and pagination to the active-knowledge-base query.
 func (s *KBService) ListKBs(ctx context.Context, userID int64, q pagination.Query) ([]model.KnowledgeBase, int64, error) {
 	return s.svcs.Deps.Repos.KB.ListKBs(ctx, userID, q.Offset(), q.Limit())
 }
 
-// GetKB 详情。
+// GetKB uses an owner-filtered lookup and translates missing/inaccessible results to KB-not-found.
 func (s *KBService) GetKB(ctx context.Context, userID, id int64) (*model.KnowledgeBase, error) {
 	kb, err := s.svcs.Deps.Repos.KB.GetKBForUser(ctx, id, userID)
 	if err != nil {
@@ -94,13 +98,14 @@ func (s *KBService) GetKB(ctx context.Context, userID, id int64) (*model.Knowled
 	return kb, nil
 }
 
-// DeleteKB 删除知识库（级联删文档/分块/向量集合）。
+// DeleteKB checks ownership, loads up to 10,000 documents, and attempts cleanup.
+// Document/vector cleanup failures are ignored here before deleting the KB row;
+// the final database deletion result is returned to the caller.
 func (s *KBService) DeleteKB(ctx context.Context, userID, id int64) error {
 	kb, err := s.GetKB(ctx, userID, id)
 	if err != nil {
 		return err
 	}
-	// 删全部文档的分块与向量
 	docs, _, err := s.svcs.Deps.Repos.KB.ListDocs(ctx, id, 0, 10000)
 	if err != nil {
 		return errcode.ErrInternal.WithCause(err)
@@ -109,14 +114,16 @@ func (s *KBService) DeleteKB(ctx context.Context, userID, id int64) error {
 		_ = s.svcs.ragEngine.DeleteDocument(ctx, kb.MilvusCollection, d.ID)
 		_ = s.svcs.Deps.Repos.KB.DeleteDoc(ctx, d.ID)
 	}
-	// 删向量集合
 	if s.svcs.Deps.Vector != nil {
 		_ = s.svcs.Deps.Vector.DropCollection(ctx, kb.MilvusCollection)
 	}
 	return s.svcs.Deps.Repos.KB.DeleteKB(ctx, id)
 }
 
-// UploadDoc 上传文档：对象存储 + 建档 + 投递 ETL 任务。
+// UploadDoc validates size/type and ownership, then creates a pending document.
+// The generated ID determines the object key. Object upload and stream publication
+// follow metadata writes; either can fail without rolling back the document row.
+// An absent publisher leaves the document pending rather than ingesting it inline.
 func (s *KBService) UploadDoc(ctx context.Context, userID, kbID int64, filename string, data []byte) (*model.Document, error) {
 	if len(data) > MaxDocSize {
 		return nil, errcode.ErrFileTooLarge
@@ -129,7 +136,7 @@ func (s *KBService) UploadDoc(ctx context.Context, userID, kbID int64, filename 
 		return nil, err
 	}
 
-	// 建档（pending 状态，ID 生成后上传对象存储）
+	// Create the pending record first to obtain an ID for the object key.
 	doc := &model.Document{
 		KBID:     kb.ID,
 		Filename: filename,
@@ -154,7 +161,6 @@ func (s *KBService) UploadDoc(ctx context.Context, userID, kbID int64, filename 
 		}
 	}
 
-	// 投递 ETL 任务（Redis Stream）
 	if s.svcs.Deps.Streams != nil {
 		if err := s.svcs.Deps.Streams.PublishDocETL(ctx, doc.ID); err != nil {
 			return nil, errcode.ErrInternal.WithCause(err)
@@ -163,7 +169,7 @@ func (s *KBService) UploadDoc(ctx context.Context, userID, kbID int64, filename 
 	return doc, nil
 }
 
-// ListDocs 文档列表。
+// ListDocs verifies access to the parent KB before returning its document page.
 func (s *KBService) ListDocs(ctx context.Context, userID, kbID int64, q pagination.Query) ([]model.Document, int64, error) {
 	if _, err := s.GetKB(ctx, userID, kbID); err != nil {
 		return nil, 0, err
@@ -171,7 +177,9 @@ func (s *KBService) ListDocs(ctx context.Context, userID, kbID int64, q paginati
 	return s.svcs.Deps.Repos.KB.ListDocs(ctx, kbID, q.Offset(), q.Limit())
 }
 
-// DeleteDoc 删除文档（分块 + 向量一并清理）。
+// DeleteDoc verifies both KB ownership and the document-to-KB relationship.
+// When RAG is attached it removes indexed content first, then deletes the document
+// record. This path does not delete the original object from MinIO.
 func (s *KBService) DeleteDoc(ctx context.Context, userID, kbID, docID int64) error {
 	kb, err := s.GetKB(ctx, userID, kbID)
 	if err != nil {
@@ -189,7 +197,7 @@ func (s *KBService) DeleteDoc(ctx context.Context, userID, kbID, docID int64) er
 	return s.svcs.Deps.Repos.KB.DeleteDoc(ctx, docID)
 }
 
-// ListChunks 分块列表。
+// ListChunks loads the document, checks its parent KB ownership, and returns chunks in sequence order.
 func (s *KBService) ListChunks(ctx context.Context, userID, docID int64, q pagination.Query) ([]model.DocumentChunk, int64, error) {
 	doc, err := s.svcs.Deps.Repos.KB.GetDoc(ctx, docID)
 	if err != nil {
@@ -201,14 +209,16 @@ func (s *KBService) ListChunks(ctx context.Context, userID, docID int64, q pagin
 	return s.svcs.Deps.Repos.KB.ListChunks(ctx, docID, q.Offset(), q.Limit())
 }
 
-// TestRetrieve 检索测试台：只检索不回答（调参用，Ep 08 演示核心）。
+// TestRetrieve checks ownership and executes retrieval without answer generation.
+// It returns a reduced reference view for inspection; an unattached RAG engine
+// produces the service's not-implemented error.
 func (s *KBService) TestRetrieve(ctx context.Context, userID, kbID int64, query string) ([]RetrievalRef, error) {
 	kb, err := s.GetKB(ctx, userID, kbID)
 	if err != nil {
 		return nil, err
 	}
 	if s.svcs.ragEngine == nil {
-		return nil, errcode.ErrNotImplement.WithMsg("rag engine 未装配")
+		return nil, errcode.ErrNotImplement.WithMsg("RAG engine is not configured")
 	}
 	refs, err := s.svcs.ragEngine.Retrieve(ctx, kb, query)
 	if err != nil {
@@ -224,7 +234,7 @@ func (s *KBService) TestRetrieve(ctx context.Context, userID, kbID int64, query 
 	return out, nil
 }
 
-// RetrievalRef 检索测试台返回项。
+// RetrievalRef exposes chunk text, source location, and score from a retrieval-only request.
 type RetrievalRef struct {
 	ChunkID  int64   `json:"chunk_id"`
 	Filename string  `json:"filename"`
@@ -233,20 +243,7 @@ type RetrievalRef struct {
 	Score    float32 `json:"score"`
 }
 
-// GetObject 读取文档原文（worker ETL 用）。
-func (s *KBService) GetObject(ctx context.Context, objectKey string) ([]byte, error) {
-	if s.minio == nil {
-		return nil, fmt.Errorf("minio client not configured")
-	}
-	obj, err := s.minio.GetObject(ctx, s.bucket, objectKey, minio.GetObjectOptions{})
-	if err != nil {
-		return nil, err
-	}
-	defer obj.Close()
-	return io.ReadAll(obj)
-}
-
-// extOf 小写扩展名（含点）。
+// extOf returns the lowercase suffix beginning at the final dot, or an empty string when none exists.
 func extOf(name string) string {
 	for i := len(name) - 1; i >= 0; i-- {
 		if name[i] == '.' {
@@ -256,6 +253,7 @@ func extOf(name string) string {
 	return ""
 }
 
+// lower normalizes ASCII uppercase bytes used by the supported extension allowlist.
 func lower(s string) string {
 	b := []byte(s)
 	for i := range b {
@@ -266,7 +264,7 @@ func lower(s string) string {
 	return string(b)
 }
 
-// mimeOf 按扩展名给 Content-Type（MinIO 下载友好）。
+// mimeOf selects the object Content-Type for supported document formats, defaulting to plain text.
 func mimeOf(name string) string {
 	switch extOf(name) {
 	case ".pdf":

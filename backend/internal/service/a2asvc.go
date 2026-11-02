@@ -1,12 +1,7 @@
-// A2A 服务：远程 Agent 注册 / 健康检查 / 任务委派（td.md §8.10，Ep 15）。
-//
-// 与 MCP 的分工（高频面试题，也是本课程的设计题眼）：
-//
-//	MCP：Agent ←→ 工具（能力扩展，无自主性）
-//	A2A：Agent ←→ Agent（委托协作，对端有自主决策能力）
-//
-// 本服务只做"注册表 + 客户端委派"；本平台对外暴露 A2A 端点由
-// a2a.Server 承担（main 装配，handler 回调 ChatService）。
+// A2A services store remote-agent registrations and send synchronous tasks.
+// Registration/health checks fetch Agent Cards; task results are reduced to state
+// and extracted text. Inbound local execution reuses ChatService rather than
+// implementing a separate model or tool pipeline.
 package service
 
 import (
@@ -21,30 +16,31 @@ import (
 	"github.com/chengpeng-cp/nexus-agent/internal/pkg/errcode"
 )
 
-// A2AService 远程 Agent 注册表业务。
+// A2AService combines the remote registry with a reusable A2A HTTP client.
 type A2AService struct {
 	svcs *Services
 	cli  *a2a.Client
 }
 
-// NewA2AService 构造。
+// NewA2AService creates the remote protocol client while sharing application persistence.
 func NewA2AService(svcs *Services) *A2AService {
 	return &A2AService{svcs: svcs, cli: a2a.NewClient()}
 }
 
-// A2ARegisterInput 注册请求。
+// A2ARegisterInput supplies the remote base URL and an optional local display name.
 type A2ARegisterInput struct {
-	Name    string `json:"name"`    // 留空取名片 name
+	Name    string `json:"name"` // Defaults to the agent card name.
 	BaseURL string `json:"base_url"`
 }
 
-// Register 注册远程 Agent：先拉名片验活，再入库快照。
+// Register fetches a reachable Agent Card before saving a connected registration.
+// An omitted display name uses card.Name. The stored card is a snapshot and
+// LastHealthAt records this successful fetch.
 func (s *A2AService) Register(ctx context.Context, in *A2ARegisterInput) (*model.A2AAgent, error) {
 	if in.BaseURL == "" {
-		return nil, errcode.ErrInvalidParam.WithMsg("base_url 不能为空")
+		return nil, errcode.ErrInvalidParam.WithMsg("base_url is required")
 	}
 
-	// 名片验活：注册即健康检查，防止存入不可达地址
 	card, err := s.cli.FetchCard(ctx, in.BaseURL)
 	if err != nil {
 		return nil, err
@@ -69,7 +65,7 @@ func (s *A2AService) Register(ctx context.Context, in *A2ARegisterInput) (*model
 	return ag, nil
 }
 
-// List 注册列表。
+// List returns registered remote agents and translates repository failures to internal errors.
 func (s *A2AService) List(ctx context.Context) ([]model.A2AAgent, error) {
 	list, err := s.svcs.Deps.Repos.A2A.List(ctx)
 	if err != nil {
@@ -78,7 +74,7 @@ func (s *A2AService) List(ctx context.Context) ([]model.A2AAgent, error) {
 	return list, nil
 }
 
-// Delete 注销。
+// Delete verifies the registration exists before removing it from the local registry.
 func (s *A2AService) Delete(ctx context.Context, id int64) error {
 	if _, err := s.get(ctx, id); err != nil {
 		return err
@@ -86,16 +82,18 @@ func (s *A2AService) Delete(ctx context.Context, id int64) error {
 	return s.svcs.Deps.Repos.A2A.Delete(ctx, id)
 }
 
-// get 统一 NotFound 转换。
+// get normalizes repository lookup failures to the remote-agent card error used by this service.
 func (s *A2AService) get(ctx context.Context, id int64) (*model.A2AAgent, error) {
 	ag, err := s.svcs.Deps.Repos.A2A.Get(ctx, id)
 	if err != nil {
-		return nil, errcode.ErrA2ACardFetch.WithMsg("远程 Agent 不存在: %d", id)
+		return nil, errcode.ErrA2ACardFetch.WithMsg("Remote Agent not found: %d", id)
 	}
 	return ag, nil
 }
 
-// HealthCheck 重新拉取名验活并刷新快照。
+// HealthCheck refetches the Agent Card and updates status and check time.
+// On failure, persisting the error state is best effort and the fetch error is
+// returned. On success, the newly fetched card replaces the cached snapshot.
 func (s *A2AService) HealthCheck(ctx context.Context, id int64) error {
 	ag, err := s.get(ctx, id)
 	if err != nil {
@@ -117,18 +115,19 @@ func (s *A2AService) HealthCheck(ctx context.Context, id int64) error {
 	return s.svcs.Deps.Repos.A2A.Update(ctx, ag)
 }
 
-// SendTaskResult 委派结果。
+// SendTaskResult carries the remote task ID/state and the text extracted from its artifacts.
 type SendTaskResult struct {
 	TaskID string `json:"task_id"`
-	State  string `json:"state"`   // completed/failed/...
-	Text   string `json:"text"`    // 从产出物中提取的回答文本
+	State  string `json:"state"` // completed/failed/...
+	Text   string `json:"text"`
 }
 
-// SendTask 委派任务给远程 Agent（message/send）。
-// 教学简化：同步等待结果；生产可扩展 message/stream（SSE）。
+// SendTask rejects empty text, loads the remote registration, and calls message/send.
+// It waits for the returned task and exposes its current state; the service
+// does not subscribe to a separate remote event stream.
 func (s *A2AService) SendTask(ctx context.Context, id int64, text string) (*SendTaskResult, error) {
 	if text == "" {
-		return nil, errcode.ErrInvalidParam.WithMsg("任务内容不能为空")
+		return nil, errcode.ErrInvalidParam.WithMsg("Task content is required")
 	}
 	ag, err := s.get(ctx, id)
 	if err != nil {
@@ -145,9 +144,10 @@ func (s *A2AService) SendTask(ctx context.Context, id int64, text string) (*Send
 	}, nil
 }
 
-// InvokeLocal 本平台作为 A2A 被调用方时的本地执行：
-// 走标准对话链路（上下文组装 → ReAct → 持久化），聚合 delta 为完整回答。
-// agentID=0 时使用平台默认助手。
+// InvokeLocal runs ChatService under the configured system identity and collects deltas.
+// Agent ID zero selects the default assistant and an empty session ID creates a
+// new conversation. Other event types are ignored except error, which aborts
+// collection and becomes an A2A task failure.
 func (s *A2AService) InvokeLocal(ctx context.Context, agentID int64, text string) (string, error) {
 	events, err := s.svcs.Chat.Stream(ctx, systemUserID, &ChatInput{
 		AgentID: agentID,
@@ -164,11 +164,11 @@ func (s *A2AService) InvokeLocal(ctx context.Context, agentID int64, text string
 			}
 		}
 		if ev.Type == agent.TypeError {
-			return "", errcode.ErrA2ATaskFail.WithMsg("本地执行失败: %v", ev.Data["message"])
+			return "", errcode.ErrA2ATaskFail.WithMsg("Local execution failed: %v", ev.Data["message"])
 		}
 	}
 	return b.String(), nil
 }
 
-// systemUserID A2A 外部调用的归属用户（教学版：0 号系统用户）。
+// systemUserID is the identity supplied to the standard chat/persistence path for inbound A2A calls.
 const systemUserID int64 = 0

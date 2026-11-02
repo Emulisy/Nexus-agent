@@ -1,15 +1,15 @@
 /**
- * GSAP 动效预设 —— 统一全站动画语言，避免各页面随手写参。
- *
- * 原则：
- * 1. 快进缓出（out-expo / power3.out），动效"跟手"不拖沓；
- * 2. 入场动画统一 0.4~0.5s，位移小（12~16px），克制即高级；
- * 3. 列表入场用 stagger，形成节奏感；
- * 4. 组件卸载时清理（配合 gsap.context / useLayoutEffect cleanup）。
+ * Shared GSAP motion presets for page entry, list items, message bubbles,
+ * collapsible panels, and validation feedback. Each helper returns the animation
+ * so callers can kill it or register it with a gsap.context cleanup. Reused
+ * elements use overwrite to avoid competing animations on the same properties.
  */
 import gsap from 'gsap';
 
-/** 页面容器入场：轻微上浮 + 淡入 */
+/**
+ * Fade and lift a page container. Pathname-driven callers can reuse the same
+ * element; overwrite prevents the previous entry tween from competing.
+ */
 export function pageEnter(el: Element) {
   return gsap.fromTo(
     el,
@@ -18,7 +18,10 @@ export function pageEnter(el: Element) {
   );
 }
 
-/** 列表子项交错入场：给每个子元素依次上浮淡入 */
+/**
+ * Animate sibling items with a shared easing and configurable delay between
+ * starts. The caller owns the returned tween or its surrounding GSAP context.
+ */
 export function staggerEnter(els: Element[] | NodeListOf<Element>, step = 0.05) {
   return gsap.fromTo(
     els,
@@ -34,7 +37,10 @@ export function staggerEnter(els: Element[] | NodeListOf<Element>, step = 0.05) 
   );
 }
 
-/** 消息气泡入场：新消息从下方弹入 */
+/**
+ * Animate a newly mounted message bubble. Streaming updates reuse the component
+ * and should not replay this animation for every incoming text fragment.
+ */
 export function bubbleIn(el: Element) {
   return gsap.fromTo(
     el,
@@ -43,7 +49,10 @@ export function bubbleIn(el: Element) {
   );
 }
 
-/** 决策链节点展开/收起 */
+/**
+ * Animate between collapsed height and measured content height. The caller
+ * controls the open state and retains overflow clipping around the animated body.
+ */
 export function expandToggle(el: Element, open: boolean) {
   if (open) {
     return gsap.fromTo(
@@ -55,20 +64,10 @@ export function expandToggle(el: Element, open: boolean) {
   return gsap.to(el, { height: 0, opacity: 0, duration: 0.25, ease: 'power2.in', overwrite: 'auto' });
 }
 
-/** 数字滚动：仪表盘统计数字从 0 滚到目标值 */
-export function countUp(el: HTMLElement, target: number, duration = 0.8) {
-  const obj = { v: 0 };
-  return gsap.to(obj, {
-    v: target,
-    duration,
-    ease: 'power2.out',
-    onUpdate: () => {
-      el.textContent = String(Math.round(obj.v));
-    },
-  });
-}
-
-/** 抖动：表单校验失败提示 */
+/**
+ * Brief horizontal validation feedback; callers keep the form and error text
+ * responsible for communicating the actual validation failure.
+ */
 export function shake(el: Element) {
   return gsap.fromTo(
     el,

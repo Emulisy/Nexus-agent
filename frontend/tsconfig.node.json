@@ -1,5 +1,6 @@
 {
   "compilerOptions": {
+    /** Separate compiler context for the Node-side Vite configuration. */
     "composite": true,
     "skipLibCheck": true,
     "module": "ESNext",

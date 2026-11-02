@@ -1,4 +1,6 @@
-// 用户数据访问。
+// User persistence supports account lookup and serialized account creation.
+// First-admin selection and duplicate checks occur inside the same transaction;
+// the service remains responsible for input validation and password hashing.
 package repo
 
 import (
@@ -10,20 +12,18 @@ import (
 	"github.com/chengpeng-cp/nexus-agent/internal/model"
 )
 
+// ErrUserAlreadyExists identifies a duplicate username/email detected inside the registration transaction.
 var ErrUserAlreadyExists = errors.New("user already exists")
 
-// UserRepo 用户表。
+// UserRepo reads user records and inserts accounts under the registration lock.
 type UserRepo struct {
 	db *gorm.DB
 }
 
-// Create 创建用户。
-func (r *UserRepo) Create(ctx context.Context, u *model.User) error {
-	return r.db.WithContext(ctx).Create(u).Error
-}
-
-// CreateFirstOrUser serializes account creation so only one concurrent first
-// registration can receive the admin role.
+// CreateFirstOrUser serializes registrations using an exclusive users-table lock.
+// Within that transaction it counts existing users, repeats the duplicate check,
+// assigns admin only when the table is empty, and inserts the supplied bcrypt hash.
+// The lock is released on commit/rollback, including any error path.
 func (r *UserRepo) CreateFirstOrUser(ctx context.Context, u *model.User) error {
 	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := tx.Exec("LOCK TABLE users IN EXCLUSIVE MODE").Error; err != nil {
@@ -51,7 +51,7 @@ func (r *UserRepo) CreateFirstOrUser(ctx context.Context, u *model.User) error {
 	})
 }
 
-// GetByID 按 ID 查询。
+// GetByID loads the account used by profile endpoints and returns GORM lookup errors unchanged.
 func (r *UserRepo) GetByID(ctx context.Context, id int64) (*model.User, error) {
 	var u model.User
 	if err := r.db.WithContext(ctx).First(&u, id).Error; err != nil {
@@ -60,7 +60,7 @@ func (r *UserRepo) GetByID(ctx context.Context, id int64) (*model.User, error) {
 	return &u, nil
 }
 
-// GetByUsername 按用户名查询（登录）。
+// GetByUsername loads the credential-bearing record needed for login; it does not validate the password.
 func (r *UserRepo) GetByUsername(ctx context.Context, username string) (*model.User, error) {
 	var u model.User
 	if err := r.db.WithContext(ctx).Where("username = ?", username).First(&u).Error; err != nil {
@@ -69,23 +69,11 @@ func (r *UserRepo) GetByUsername(ctx context.Context, username string) (*model.U
 	return &u, nil
 }
 
-// ExistsBy 徽记查询：用户名/邮箱是否已存在。
+// ExistsBy checks username/email collisions before hashing; creation repeats this check under lock.
 func (r *UserRepo) ExistsBy(ctx context.Context, username, email string) (bool, error) {
 	var count int64
 	err := r.db.WithContext(ctx).Model(&model.User{}).
 		Where("username = ? OR email = ?", username, email).
 		Count(&count).Error
 	return count > 0, err
-}
-
-// Update 更新用户。
-func (r *UserRepo) Update(ctx context.Context, u *model.User) error {
-	return r.db.WithContext(ctx).Save(u).Error
-}
-
-// Count 统计用户总数（首个注册用户提升为 admin）。
-func (r *UserRepo) Count(ctx context.Context) (int64, error) {
-	var n int64
-	err := r.db.WithContext(ctx).Model(&model.User{}).Count(&n).Error
-	return n, err
 }

@@ -1,32 +1,37 @@
 /**
- * 认证域类型 —— 对应 model/auth.go 与 security/jwt.go。
+ * Authentication payloads and the public user projection returned by /me.
+ * Token storage belongs to the auth store; these types describe wire payloads
+ * and do not contain persistence or refresh scheduling behavior.
  */
-
-/** 当前用户信息（GET /api/v1/me 返回字段） */
+/** Public identity used by route guards, account controls, and role-based navigation. */
 export interface User {
   id: number;
   username: string;
   email?: string;
+  /** Determines client-side admin navigation; API authorization is checked separately. */
   role: 'admin' | 'user';
   avatar_url?: string;
 }
 
-/** 双 Token（POST /auth/login 与 /auth/refresh 的 data） */
+/**
+ * Token exchange result returned by login and refresh. The frontend rotates the
+ * persisted refresh token whenever this payload is received.
+ */
 export interface TokenPair {
   access_token: string;
   refresh_token: string;
-  /** access token 有效期（秒） */
+  /** Access token lifetime in seconds. */
   expires_in?: number;
 }
 
-/** 注册请求 */
+/** Registration form payload; a separate login request establishes the session. */
 export interface RegisterReq {
   username: string;
   email: string;
   password: string;
 }
 
-/** 登录请求 */
+/** Username/password credentials submitted to the login endpoint. */
 export interface LoginReq {
   username: string;
   password: string;

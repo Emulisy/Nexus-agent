@@ -1,29 +1,26 @@
 /**
- * 决策链时间线 —— Agent "思考过程"可视化。
- *
- * 数据来源两路（同构渲染）：
- * 1. 历史消息：messages[].metadata.agent_trace（TraceStep[]，一次性渲染）；
- * 2. 流式消息：tool_call/tool_result 事件实时追加（由 ChatPage 组装成 TraceStep 形状）。
- *
- * 设计三原则（ep19 走读 3）：
- * - 默认折叠：一行摘要 + 展开箭头，思考过程对普通用户是噪音；
- * - 失败醒目：status 为 error/timeout 的节点标红；
- * - 渐进展开：进行中显示"调用中"，结束后回填结果。
+ * Expandable trace rows shared by live tool calls and persisted agent traces.
+ * Live calls are adapted from the store map with running as the default status.
+ * Details retain structured arguments and a bounded result preview, while
+ * expansion hooks apply height animations only after the first render.
  */
 import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { clsx } from 'clsx';
 import { expandToggle } from '@/lib/gsap';
 import type { TraceStep } from '@/types/chat';
 
-/** 步骤类型 → 中文标签 */
+/**
+ * Localized labels for persisted trace categories; unfamiliar types retain
+ * their raw identifier in the row fallback.
+ */
 const LABEL: Record<string, string> = {
-  plan: '计划',
-  thought: '思考',
-  action: '调用工具',
-  observe: '观察',
-  delegate: '委派',
-  merge: '聚合',
-  answer: '回答',
+  plan: 'Plan',
+  thought: 'Thought',
+  action: 'Tool call',
+  observe: 'Observation',
+  delegate: 'Delegate',
+  merge: 'Merge',
+  answer: 'Answer',
 };
 
 const TYPE_ICON: Record<string, string> = {
@@ -36,7 +33,10 @@ const TYPE_ICON: Record<string, string> = {
   answer: '✓',
 };
 
-/** 展开/收起的 GSAP 高度动画 hook（首渲染不动画） */
+/**
+ * Skip animation on the initial render because the caller already sets the
+ * initial height. Subsequent open-state changes animate the same content body.
+ */
 function useRefForExpand(open: boolean) {
   const ref = useRef<HTMLDivElement>(null);
   const first = useRef(true);
@@ -51,6 +51,10 @@ function useRefForExpand(open: boolean) {
   return ref;
 }
 
+/**
+ * Show timing and outcome at row level while keeping verbose arguments and
+ * results behind an accessible expansion button.
+ */
 function StepRow({ step }: { step: TraceStep }) {
   const [open, setOpen] = useState(false);
   const bodyRef = useRefForExpand(open);
@@ -58,11 +62,10 @@ function StepRow({ step }: { step: TraceStep }) {
   const running = step.status === 'running';
 
   return (
-    <li className={clsx('relative pl-6', failed && 'text-coral')}>
-      {/* 时间线圆点 */}
+    <li className={clsx('relative pl-7', failed && 'text-coral')}>
       <span
         className={clsx(
-          'absolute left-0 top-1 flex h-4 w-4 items-center justify-center rounded-full border text-[9px]',
+          'absolute left-0 top-0.5 flex h-5 w-5 items-center justify-center rounded-full border text-[10px]',
           failed
             ? 'border-coral/60 bg-coral/15 text-coral'
             : running
@@ -73,9 +76,9 @@ function StepRow({ step }: { step: TraceStep }) {
         {TYPE_ICON[step.type] ?? '·'}
       </span>
 
-      {/* 标题行：类型 · 工具/Agent · 耗时 —— 可点击展开 */}
       <button
-        className="flex w-full items-baseline gap-2 text-left text-xs transition-colors hover:text-bone"
+        className="flex w-full flex-wrap items-baseline gap-x-2 gap-y-1 py-0.5 text-left text-xs transition-colors hover:text-bone"
+        aria-expanded={open}
         onClick={() => setOpen((v) => !v)}
       >
         <span className={clsx('font-medium', failed ? 'text-coral' : 'text-mist')}>
@@ -89,11 +92,10 @@ function StepRow({ step }: { step: TraceStep }) {
             {step.elapsed_ms}ms
           </span>
         )}
-        {running && <span className="animate-pulse text-lime">调用中…</span>}
-        {failed && <span className="text-coral">✕ {step.status === 'timeout' ? '超时' : '失败'}</span>}
+        {running && <span className="animate-pulse text-lime">Calling…</span>}
+        {failed && <span className="text-coral">✕ {step.status === 'timeout' ? 'Timed out' : 'Failed'}</span>}
       </button>
 
-      {/* 展开体：思考内容 / 参数 / 结果 */}
       <div ref={bodyRef} className="overflow-hidden" style={{ height: open ? 'auto' : 0 }}>
         {step.content && (
           <p className="mt-1 whitespace-pre-wrap text-xs leading-relaxed text-fog">{step.content}</p>
@@ -109,10 +111,11 @@ function StepRow({ step }: { step: TraceStep }) {
   );
 }
 
+/** Render ordered trace snapshots using the backend sequence identifier when present. */
 export function TraceTimeline({ steps }: { steps: TraceStep[] }) {
   if (!steps?.length) return null;
   return (
-    <ol className="space-y-2.5">
+    <ol className="trace-timeline space-y-4">
       {steps.map((s) => (
         <StepRow key={s.seq ?? `${s.time}-${s.type}`} step={s} />
       ))}
@@ -120,7 +123,10 @@ export function TraceTimeline({ steps }: { steps: TraceStep[] }) {
   );
 }
 
-/** 供流式消息使用：把 tools map 转为 TraceStep 数组 */
+/**
+ * Project live tool calls into the persisted trace-view shape. Object insertion
+ * order supplies display order, and a missing result status means the call is running.
+ */
 export function streamingToSteps(
   tools: Record<
     string,
@@ -141,6 +147,10 @@ export function streamingToSteps(
   }));
 }
 
+/**
+ * Parse structured tool arguments for inspection. Preserve malformed input
+ * as a raw field instead of hiding the entire timeline node.
+ */
 function safeParse(s?: string): Record<string, unknown> | undefined {
   if (!s) return undefined;
   try {
@@ -150,7 +160,10 @@ function safeParse(s?: string): Record<string, unknown> | undefined {
   }
 }
 
-/** 折叠容器：带 GSAP 展开动画（"思考过程"折叠区用） */
+/**
+ * Reusable disclosure with aria-expanded state and a height-animated body.
+ * The caller supplies its own content semantics and optional summary badge.
+ */
 export function Collapse({
   title,
   badge,
@@ -163,17 +176,18 @@ export function Collapse({
   const [open, setOpen] = useState(false);
   const ref = useRefForExpand(open);
   return (
-    <div className="rounded-lg border border-smoke/60 bg-carbon/60">
+    <div className="trace-collapse rounded-xl border border-smoke/70 bg-void/60">
       <button
-        className="flex w-full items-center gap-2 px-3 py-2 text-xs text-fog transition-colors hover:text-mist"
+        className="flex w-full items-center gap-2 rounded-xl px-3 py-2.5 text-xs text-fog transition-colors hover:bg-graphite/70 hover:text-mist"
+        aria-expanded={open}
         onClick={() => setOpen((v) => !v)}
       >
-        <span className={clsx('transition-transform duration-200', open && 'rotate-90')}>▸</span>
+        <svg aria-hidden="true" className={clsx('h-3.5 w-3.5 shrink-0 transition-transform duration-200', open && 'rotate-90')} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="m9 6 6 6-6 6" /></svg>
         <span>{title}</span>
         {badge && <span className="text-ash">{badge}</span>}
       </button>
       <div ref={ref} className="overflow-hidden" style={{ height: open ? 'auto' : 0 }}>
-        <div className="px-3 pb-3">{children}</div>
+        <div className="px-3 pt-1 pb-3 text-xs leading-relaxed text-fog">{children}</div>
       </div>
     </div>
   );

@@ -1,5 +1,5 @@
-// 重试：指数退避（td.md §8.1）。
-// 仅对可重试错误（429/5xx/网络）重试；流式请求首字节后不再重试（由调用方控制）。
+// The retry policy applies to explicitly classified transient failures. Streaming
+// requests use it only while opening their response, before a stream is handed out.
 package llm
 
 import (
@@ -8,19 +8,23 @@ import (
 	"time"
 )
 
-// RetryConfig 重试参数。
+// RetryConfig controls attempts and exponential backoff. MaxAttempts includes
+// the first call, and delays are jittered after applying the configured cap.
 type RetryConfig struct {
-	MaxAttempts int           // 最大尝试次数（含首次）
-	BaseDelay   time.Duration // 基础退避
-	MaxDelay    time.Duration // 退避上限
+	MaxAttempts int
+	BaseDelay   time.Duration
+	MaxDelay    time.Duration
 }
 
-// DefaultRetryConfig 默认配置：3 次，100ms 起，退避上限 2s。
+// DefaultRetryConfig permits three attempts starting at 100 ms with a 2 s base
+// backoff cap. The jitter adds up to one quarter of the capped delay.
 func DefaultRetryConfig() RetryConfig {
 	return RetryConfig{MaxAttempts: 3, BaseDelay: 100 * time.Millisecond, MaxDelay: 2 * time.Second}
 }
 
-// Do 执行 fn，可重试错误按指数退避重试，其余错误立即返回。
+// RetryDo stops immediately on success, cancellation, or a non-retryable error.
+// Transient errors wait with exponential backoff before the next attempt; waiting
+// also respects context cancellation. The last failure is returned on exhaustion.
 func RetryDo(ctx context.Context, cfg RetryConfig, fn func(ctx context.Context) error) error {
 	var lastErr error
 	for attempt := 0; attempt < cfg.MaxAttempts; attempt++ {
@@ -34,7 +38,9 @@ func RetryDo(ctx context.Context, cfg RetryConfig, fn func(ctx context.Context) 
 		if !IsRetryable(lastErr) {
 			return lastErr
 		}
-		// 指数退避 + 抖动：100ms, 200ms, 400ms...
+
+		// Cap the exponential component before adding jitter to avoid synchronized
+		// retries from concurrent requests.
 		delay := cfg.BaseDelay << attempt
 		if delay > cfg.MaxDelay {
 			delay = cfg.MaxDelay

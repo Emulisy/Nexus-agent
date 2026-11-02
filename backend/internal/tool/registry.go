@@ -1,6 +1,3 @@
-// 内置工具注册表（td.md §8.7）。
-// 注册表模式：新增内置工具 = 写一个 handler + Register 一行，
-// Ep 04 教学点：工具描述（description/JSON Schema）质量直接决定模型调用准确率。
 package tool
 
 import (
@@ -8,25 +5,28 @@ import (
 	"sync"
 )
 
-// registry 内置工具注册表实现。
+// registry protects handler registration and lookup with an RWMutex so service
+// initialization or integration refreshes can coexist with tool dispatch.
 type registry struct {
 	mu       sync.RWMutex
 	handlers map[string]BuiltinHandler
 }
 
-// NewRegistry 构造空注册表。
+// NewRegistry creates an empty handler table; built-ins and integration proxies
+// are registered by application wiring.
 func NewRegistry() Registry {
 	return &registry{handlers: map[string]BuiltinHandler{}}
 }
 
-// Register 注册（同 code 覆盖，便于测试替换）。
+// Register installs or replaces the implementation for a code. Replacement lets
+// an integration refresh update its proxy without changing stored tool bindings.
 func (r *registry) Register(code string, h BuiltinHandler) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.handlers[code] = h
 }
 
-// Get 查找。
+// Get returns a handler snapshot; execution happens after the read lock is released.
 func (r *registry) Get(code string) (BuiltinHandler, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -34,7 +34,8 @@ func (r *registry) Get(code string) (BuiltinHandler, bool) {
 	return h, ok
 }
 
-// Codes 列出全部已注册 code（排序，稳定输出）。
+// Codes returns a sorted copy of registered names for deterministic enumeration
+// without exposing the mutable handler map.
 func (r *registry) Codes() []string {
 	r.mu.RLock()
 	defer r.mu.RUnlock()

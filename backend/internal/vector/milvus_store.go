@@ -1,4 +1,5 @@
-// Milvus 实现的 VectorStore。
+// The Milvus adapter converts application records into SDK columns and vector hits.
+// Memory collections have user/Agent fields; other collections use the KB schema.
 package vector
 
 import (
@@ -11,15 +12,17 @@ import (
 	"github.com/chengpeng-cp/nexus-agent/internal/infra"
 )
 
-// MilvusStore 基于 milvus-sdk-go 的实现。
+// MilvusStore adapts one reusable SDK client to Store operations.
 type MilvusStore struct {
 	cli client.Client
 }
 
-// NewMilvusStore 构造。
+// NewMilvusStore wraps an initialized client without creating collections.
 func NewMilvusStore(cli client.Client) *MilvusStore { return &MilvusStore{cli: cli} }
 
-// EnsureCollection 确保知识库/记忆集合存在。
+// EnsureCollection returns immediately for an existing collection. Otherwise it
+// selects the memory or KB schema, creates a cosine HNSW index, and loads the
+// collection. It does not validate or migrate the schema of an existing collection.
 func (s *MilvusStore) EnsureCollection(ctx context.Context, collection string, dim int) error {
 	has, err := s.cli.HasCollection(ctx, collection)
 	if err != nil {
@@ -29,28 +32,27 @@ func (s *MilvusStore) EnsureCollection(ctx context.Context, collection string, d
 		return nil
 	}
 
-	// 记忆集合与知识库集合字段不同：按命名约定区分
 	var schema *entity.Schema
 	if collection == "memories" {
 		schema = infra.NewMemorySchema(collection, dim)
 	} else {
 		schema = infra.NewKBSchema(collection, dim)
 	}
-	if err := s.cli.CreateCollection(ctx, schema, 2); err != nil { // 2 分片
+	if err := s.cli.CreateCollection(ctx, schema, 2); err != nil {
 		return fmt.Errorf("create collection: %w", err)
 	}
 	idx, err := infra.NewHNSWIndex(dim)
 	if err != nil {
 		return fmt.Errorf("hnsw index: %w", err)
 	}
-	// CreateIndex 需指定向量字段名（两套集合字段名不同）
+
 	if err := s.cli.CreateIndex(ctx, collection, vectorField(collection), idx, false); err != nil {
 		return fmt.Errorf("create index: %w", err)
 	}
 	return s.cli.LoadCollection(ctx, collection, false)
 }
 
-// vectorField 集合的向量字段名（Schema 定义见 infra.NewKBSchema/NewMemorySchema）。
+// vectorField chooses vector for the shared memory collection and dense for KBs.
 func vectorField(collection string) string {
 	if collection == "memories" {
 		return "vector"
@@ -58,7 +60,9 @@ func vectorField(collection string) string {
 	return KBDenseField
 }
 
-// Upsert 写入向量（Milvus 无原生 upsert 语义时用 insert 教学简化；幂等由主键保证）。
+// Upsert constructs schema-specific scalar/vector columns, calls SDK Insert,
+// and flushes the collection. This implementation does not issue a native upsert
+// or delete older rows first; callers must account for that write behavior.
 func (s *MilvusStore) Upsert(ctx context.Context, collection string, records []Record) error {
 	if len(records) == 0 {
 		return nil
@@ -73,10 +77,8 @@ func (s *MilvusStore) Upsert(ctx context.Context, collection string, records []R
 		metas = append(metas, r.Metadata)
 	}
 
-	// 通用元数据列：把动态字段拆列（doc_id/seq/page/user_id/agent_id...）
 	cols := []entity.Column{entity.NewColumnInt64("id", ids)}
 
-	// 判断集合类型：记忆集合带 user_id 列
 	if collection == "memories" {
 		uids := i64FromMeta(metas, "user_id")
 		aids := i64FromMeta(metas, "agent_id")
@@ -98,17 +100,17 @@ func (s *MilvusStore) Upsert(ctx context.Context, collection string, records []R
 	return s.cli.Flush(ctx, collection, false)
 }
 
-// KBDenseField 稠密向量列名。
 const KBDenseField = "dense"
 
-// Search 最近邻检索。
+// Search issues one cosine nearest-neighbor query with bounded consistency and
+// HNSW ef=64. It returns IDs and scores only; malformed ID columns are skipped
+// and document or memory content is resolved separately by the application.
 func (s *MilvusStore) Search(ctx context.Context, collection string, vector []float32, topK int) ([]SearchHit, error) {
-	// HNSW 搜索参数：ef 决定候选队列长度（越大越准越慢）
 	sp, err := entity.NewIndexHNSWSearchParam(64)
 	if err != nil {
 		return nil, fmt.Errorf("search param: %w", err)
 	}
-	// v2.4.2 Search 全签名：expr / outputFields / vectors / 向量字段 / 度量类型 / topK / 参数
+
 	results, err := s.cli.Search(ctx, collection, nil, "",
 		[]string{"id"}, []entity.Vector{entity.FloatVector(vector)},
 		vectorField(collection), entity.COSINE, topK, sp,
@@ -138,16 +140,17 @@ func (s *MilvusStore) Search(ctx context.Context, collection string, vector []fl
 	return hits, nil
 }
 
-// Delete 按主键删除。
+// Delete removes the supplied primary keys through an id-in expression.
+// An empty ID set is a no-op and no SQL rows are changed by this operation.
 func (s *MilvusStore) Delete(ctx context.Context, collection string, ids []int64) error {
 	if len(ids) == 0 {
 		return nil
 	}
 	expr := fmt.Sprintf("id in %s", fmtInt64Slice(ids))
-	return s.cli.Delete(ctx, collection, "", expr) // partitionName 空串 = 全部分区
+	return s.cli.Delete(ctx, collection, "", expr)
 }
 
-// DropCollection 删除集合。
+// DropCollection first checks existence so an already-missing collection is a no-op.
 func (s *MilvusStore) DropCollection(ctx context.Context, collection string) error {
 	has, err := s.cli.HasCollection(ctx, collection)
 	if err != nil || !has {
@@ -156,7 +159,7 @@ func (s *MilvusStore) DropCollection(ctx context.Context, collection string) err
 	return s.cli.DropCollection(ctx, collection)
 }
 
-// Count 统计行数。
+// Count reads the collection aggregate count and returns zero for an empty result.
 func (s *MilvusStore) Count(ctx context.Context, collection string) (int64, error) {
 	rows, err := s.cli.Query(ctx, collection, nil, "", []string{"count(*)"})
 	if err != nil {
@@ -165,12 +168,11 @@ func (s *MilvusStore) Count(ctx context.Context, collection string) (int64, erro
 	if len(rows) == 0 {
 		return 0, nil
 	}
-	// count(*) 结果列
+
 	return rows[0].(*entity.ColumnInt64).ValueByIdx(0)
 }
 
-// ---- metadata 提取辅助 ----
-
+// i64FromMeta extracts int64 metadata columns, leaving missing or differently typed values as zero.
 func i64FromMeta(metas []map[string]any, key string) []int64 {
 	out := make([]int64, len(metas))
 	for i, m := range metas {
@@ -181,6 +183,7 @@ func i64FromMeta(metas []map[string]any, key string) []int64 {
 	return out
 }
 
+// i32FromMeta converts int and int64 metadata to the int32 scalar columns required by KB schemas.
 func i32FromMeta(metas []map[string]any, key string) []int32 {
 	out := make([]int32, len(metas))
 	for i, m := range metas {
@@ -194,6 +197,7 @@ func i32FromMeta(metas []map[string]any, key string) []int32 {
 	return out
 }
 
+// strFromMeta extracts string metadata, retaining an empty value for missing fields.
 func strFromMeta(metas []map[string]any, key string) []string {
 	out := make([]string, len(metas))
 	for i, m := range metas {
@@ -204,6 +208,7 @@ func strFromMeta(metas []map[string]any, key string) []string {
 	return out
 }
 
+// fmtInt64Slice serializes trusted integer IDs into the list syntax used by Milvus filters.
 func fmtInt64Slice(ids []int64) string {
 	b := "["
 	for i, id := range ids {

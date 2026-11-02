@@ -1,28 +1,27 @@
 /**
- * Agent 与工具接口 —— 对应 router.go Agent 分组。
+ * Agent management and the tool catalog used by the binding editor.
+ * Request objects follow the backend Agent payload; server-owned identifiers,
+ * timestamps, and preset status are excluded from AgentReq.
  */
 import { http } from '@/lib/request';
 import type { Paged, PageQuery } from '@/types/api';
 import type { Agent, AgentReq, Tool } from '@/types/agent';
 
-/** Agent 列表（分页） */
+/** Fetch a paged catalog visible to the authenticated user, including accessible presets. */
 export const listAgents = (q?: PageQuery) =>
   http.get<Paged<Agent>>('/agents', q);
 
-/** Agent 详情 */
-export const getAgent = (id: number) => http.get<Agent>(`/agents/${id}`);
-
-/** 创建 Agent */
+/** Create an Agent from editor fields; the backend supplies resource metadata. */
 export const createAgent = (req: AgentReq) =>
   http.post<Agent>('/agents', req);
 
-/** 更新 Agent */
+/** Submit editable Agent fields for an existing resource. */
 export const updateAgent = (id: number, req: AgentReq) =>
   http.put<Agent>(`/agents/${id}`, req);
 
-/** 删除 Agent */
+/** Delete an owned Agent. Preset restrictions are enforced by the backend. */
 export const deleteAgent = (id: number) => http.delete(`/agents/${id}`);
 
-/** 工具清单（分页） */
+/** Fetch the tool catalog used to resolve and display Agent bindings. */
 export const listTools = (q?: PageQuery) =>
   http.get<Paged<Tool>>('/tools', q);

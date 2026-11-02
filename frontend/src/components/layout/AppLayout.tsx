@@ -1,6 +1,7 @@
 /**
- * 应用布局壳 —— 侧边栏 + 顶栏 + 内容区。
- * 路由切换时对内容区做 GSAP 淡入（页面过渡动画）。
+ * Authenticated workspace shell with navigation, account controls, and the
+ * nested route outlet. The shell survives child-route changes; its content
+ * container receives the shared entry animation when the pathname changes.
  */
 import { useEffect, useRef } from 'react';
 import { Outlet, useLocation } from 'react-router-dom';
@@ -12,19 +13,24 @@ export function AppLayout() {
   const location = useLocation();
   const mainRef = useRef<HTMLDivElement>(null);
 
-  // 每次路由变化：内容区入场动画
+  /**
+   * Reanimate the existing content container on pathname changes. Query-string
+   * changes alone do not trigger another page entrance.
+   */
   useEffect(() => {
     if (mainRef.current) pageEnter(mainRef.current);
   }, [location.pathname]);
 
   return (
-    <div className="flex h-full overflow-hidden">
-      <Sidebar />
-      <div className="flex min-w-0 flex-1 flex-col">
-        <Topbar />
-        <main ref={mainRef} className="min-h-0 flex-1 overflow-y-auto">
-          <Outlet />
-        </main>
+    <div className="app-canvas">
+      <div className="app-shell">
+        <Sidebar />
+        <div className="flex min-w-0 flex-1 flex-col">
+          <Topbar />
+          <main ref={mainRef} className="app-content">
+            <Outlet />
+          </main>
+        </div>
       </div>
     </div>
   );

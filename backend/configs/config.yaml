@@ -1,33 +1,46 @@
-# NexusAgent 默认配置
-# 覆盖优先级：环境变量(NX_ 前缀) > config.{env}.yaml > config.yaml
-# 环境变量映射示例：http.port -> NX_HTTP__PORT
+# Shared configuration for the API server, migration command, and document worker.
+# These addresses target dependencies exposed on the host by Docker Compose;
+# containers running the application need addresses reachable from their own network.
+#
+# Load order: config.yaml, then optional config.{NX_ENV}.yaml, then NX_ overrides.
+# NX_ENV defaults to dev. Nested keys use double underscores, for example
+# http.port -> NX_HTTP__PORT. backend/.env then project-root .env fill missing
+# process environment values before configuration is loaded.
 
-env: dev
+env: dev  # The loader assigns the effective environment from NX_ENV.
 http:
   port: 8080
+  # Maximum time allowed for the HTTP server to drain during shutdown.
   shutdown_timeout: 10s
 
+# Logs are written to stdout; console format is useful for local inspection.
 log:
   level: info       # debug/info/warn/error
-  format: json      # json/console
+  format: console      # json/console
 
+# PostgreSQL owns application records, including messages, model definitions,
+# document text, workflow runs, and memory metadata. Each process has its own pool.
 pg:
   dsn: postgres://nexus:nexus123@localhost:5432/nexus_agent?sslmode=disable&search_path=public
   max_open_conns: 50
   max_idle_conns: 10
-  conn_max_lifetime: 30m
+  conn_max_lifetime: 30m  # Maximum connection age before the SQL pool retires it.
 
+# Redis stores refresh-token state and the document ingestion stream.
+# Chat history is read from PostgreSQL rather than cached in Redis.
 redis:
-  addr: 127.0.0.1:6380  # 与 docker-compose 的 6380:6379 映射一致
+  addr: 127.0.0.1:6380  # Host port exposed by Docker Compose.
   password: ""
   db: 0
 
+# Milvus stores dense vectors. dim must match the embedding model and collection
+# schema; changing the model or dimension does not rebuild existing vectors.
 milvus:
-  mode: remote          # remote / lite
   addr: 127.0.0.1:19530
-  lite_path: ./data/milvus_lite.db
-  dim: 1024             # bge-m3 向量维度
+  dim: 1024             # bge-m3 embedding dimension.
 
+# Original document uploads are kept in this bucket. The API ensures the bucket
+# exists at startup, and workers read objects by the keys stored in PostgreSQL.
 minio:
   endpoint: 127.0.0.1:9000
   access_key: minioadmin
@@ -35,68 +48,72 @@ minio:
   bucket: nexus-docs
   use_ssl: false
 
+# Access tokens authenticate API requests. Refresh tokens have a longer lifetime
+# and are checked against Redis when exchanged or revoked.
 jwt:
-  secret: change-me-in-prod      # 生产务必更换
+  secret: change-me-in-prod      # Local development signing key.
   access_ttl: 15m
   refresh_ttl: 168h
 
-secret_key: change-me-32-bytes!!  # 敏感配置 AES-GCM 主密钥(16/24/32字节)
+# The encryptor derives an AES-256 key from this master value. Keep it consistent
+# across API and worker processes so both can decrypt saved provider credentials.
+secret_key: change-me-32-bytes!!  # Keep stable to decrypt existing saved API keys.
 
 llm:
-  # 并发与熔断
+  # Provider-code-scoped limits and circuit state are held inside each process.
+  # For streaming chat, the semaphore covers opening the upstream response.
   max_conns_per_provider: 16
-  circuit_error_rate: 0.3        # 错误率熔断阈值
-  circuit_open: 60s              # 熔断持续时间
-  retry_max: 3                   # 指数退避重试次数
-  stream_first_token_timeout: 30s
-  local: false                   # true 时使用 ollama 本地模型跑通全流程
-  default_chat: deepseek-chat
+  circuit_error_rate: 0.3        # Failure ratio that opens the circuit.
+  circuit_open: 60s              # Delay before retrying an open circuit.
+  # Aliases resolved against enabled model records; provider keys live in the DB.
+  default_chat: ""             # Auto-select a configured model; override with a preset alias.
   default_embedding: bge-m3
 
 rag:
+  # Chunk lengths and overlap are measured in Unicode code points, not tokens.
+  # Knowledge-base-specific values take precedence when they are positive.
   chunk_size: 512
   chunk_overlap: 64
+  # Retrieve dense Milvus and SQL keyword candidates, then combine their ranks.
   dense_top_k: 25
-  sparse_top_k: 25
+  sparse_top_k: 25  # Candidate limit for the PostgreSQL keyword path.
   fused_top_n: 15
   final_top_k: 5
-  rrf_k: 60
-  score_threshold: 0.35
-  batch_embed: 64
+  rrf_k: 60  # RRF smoothing constant; fusion uses ranks rather than raw scores.
+  score_threshold: 0.35  # Applied after successful reranking, retaining the first three hits.
+  batch_embed: 64  # Maximum document chunks sent in one embedding request.
 
 agent:
-  max_iterations: 10
+  max_iterations: 10  # Actual chat runs use the selected Agent's max_iterations.
+  # step_timeout bounds each model call; run_timeout bounds the full tool loop.
   step_timeout: 60s
   run_timeout: 5m
-  memory_extract_every: 6        # 每 N 条消息触发一次长期记忆抽取
+  # With long-term memory enabled, extract from this many recent messages after
+  # each response. A nonpositive value disables extraction; this is not a cadence.
+  memory_extract_every: 6
 
 worker:
+  # Consumers share a Redis consumer group. Reclaim polling handles messages left
+  # pending for at least three minutes; ordinary failures go to the dead-letter stream.
   concurrency: 4
-  max_retry: 3
-  claim_interval: 30s            # XAUTOCLAIM 收尸间隔
+  claim_interval: 30s            # Interval for reclaiming idle Redis Stream messages.
 
 sandbox:
-  enabled: false                 # P0 基础版默认关闭，Ep 15 打开
+  # Enabling registers code_exec when the Docker client can be constructed.
+  # The image must supply the requested runtimes; container CPU/memory limits
+  # are fixed in the sandbox implementation rather than configured here.
+  enabled: false
   image: nexus/sandbox:latest
-  memory: 512m
-  cpus: "1"
   timeout: 30s
-  pool_size: 2
-
-observability:
-  otel_endpoint: http://127.0.0.1:4318   # Jaeger OTLP HTTP
-  otel_enabled: true
-  metrics_enabled: true
-
-mcp:
-  enabled: true
-  health_interval: 60s
 
 a2a:
+  # Optional external-agent listener, separate from the HTTP API server.
+  # name and desc are published in the discovery card.
   enabled: true
-  port: "8082"          # 对外 A2A 端点（/.well-known/agent.json + /a2a）
-  name: NexusAgent
-  desc: 通用智能体平台：ReAct / RAG / 多智能体协作
+  port: "8082"          # Serves /.well-known/agent.json and /a2a.
+  name: SupaAgent
+  desc: General-purpose agent platform with ReAct, RAG, and multi-agent collaboration
 
 search:
+  # The optional search Compose profile provides this JSON endpoint.
   searxng_url: http://127.0.0.1:8081/search

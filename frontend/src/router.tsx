@@ -1,8 +1,7 @@
 /**
- * 路由表 —— 含登录守卫与 admin 守卫。
- *
- * 守卫策略：bootstrap 完成前渲染启动屏（防止刷新闪跳登录页）；
- * 未登录 → 重定向 /login；非 admin 访问 /admin/* → 重定向 /chat。
+ * Route definitions and client-side access guards.
+ * Protected routes wait for session restoration, then require a current user.
+ * Admin pages add a role check; backend authorization remains authoritative.
  */
 import { Navigate, Route, Routes, useLocation } from 'react-router-dom';
 import type { ReactNode } from 'react';
@@ -21,7 +20,11 @@ import { ModelsAdminPage } from '@/pages/admin/ModelsAdminPage';
 import { IntegrationsPage } from '@/pages/admin/IntegrationsPage';
 import { NotFoundPage } from '@/pages/NotFoundPage';
 
-/** 登录守卫 */
+/**
+ * Defer authentication decisions until bootstrap settles so a page reload does
+ * not redirect a recoverable session prematurely. The attempted pathname is
+ * recorded in navigation state, although the current login page returns to chat.
+ */
 function RequireAuth({ children }: { children: ReactNode }) {
   const { user, bootstrapped } = useAuth();
   const location = useLocation();
@@ -30,23 +33,30 @@ function RequireAuth({ children }: { children: ReactNode }) {
   return <>{children}</>;
 }
 
-/** admin 守卫 */
+/**
+ * Hide admin pages from non-admin users after authentication has succeeded.
+ * This is a navigation guard, not a substitute for server-side authorization.
+ */
 function RequireAdmin({ children }: { children: ReactNode }) {
   const user = useAuth((s) => s.user);
   if (user?.role !== 'admin') return <Navigate to="/chat" replace />;
   return <>{children}</>;
 }
 
-/** 启动屏：会话恢复中 */
+/** Startup placeholder shown while the persisted refresh token is being checked. */
 function BootScreen() {
   return (
     <div className="flex h-full items-center justify-center gap-3 text-fog">
       <Spinner />
-      <span className="text-sm">正在恢复会话…</span>
+      <span className="text-sm">Restoring your session…</span>
     </div>
   );
 }
 
+/**
+ * Keep the authenticated shell mounted around feature pages. The login route
+ * lives outside the shell, and the wildcard uses the authenticated fallback view.
+ */
 export function AppRoutes() {
   return (
     <Routes>

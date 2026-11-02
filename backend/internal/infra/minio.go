@@ -1,4 +1,4 @@
-// 基础设施：MinIO 对象存储（原始文档/附件）。
+// Object storage retains original uploads independently of SQL metadata and vectors.
 package infra
 
 import (
@@ -11,7 +11,9 @@ import (
 	"github.com/chengpeng-cp/nexus-agent/internal/config"
 )
 
-// NewMinIO 初始化 MinIO 客户端并确保桶存在。
+// NewMinIO configures static S3 credentials and TLS from application settings.
+// It checks the document bucket and creates it when absent, returning initialization
+// or bucket-access errors before document operations begin.
 func NewMinIO(ctx context.Context, cfg *config.MinIO) (*minio.Client, error) {
 	cli, err := minio.New(cfg.Endpoint, &minio.Options{
 		Creds:  credentials.NewStaticV4(cfg.AccessKey, cfg.SecretKey, ""),
@@ -33,7 +35,8 @@ func NewMinIO(ctx context.Context, cfg *config.MinIO) (*minio.Client, error) {
 	return cli, nil
 }
 
-// ObjectKey 生成文档对象 Key：docs/{kbID}/{docID}_{filename}。
+// ObjectKey derives an upload key from the knowledge-base ID, document ID, and
+// filename. The service persists this key so the worker can retrieve the original.
 func ObjectKey(kbID, docID int64, filename string) string {
 	return fmt.Sprintf("docs/%d/%d_%s", kbID, docID, filename)
 }

@@ -1,26 +1,23 @@
-# bin
+# Locally compiled commands and platform-specific executables.
 /bin/
 *.exe
 
-# local env & secrets
+# Developer environment files and local configuration overrides may contain secrets.
 *.local.yaml
 .env
 .env.*
+!.env.example
 
-# logs
+# Runtime output is not part of the source distribution.
 *.log
 
-# test & coverage
-coverage.out
-coverage.html
-
-# os
+# Operating-system metadata.
 .DS_Store
 
-# ide
+# Per-developer editor settings.
 .idea/
 .vscode/
 
-# milvus lite local data
+# Runtime attachments and local database files are created outside tracked source.
 *.db
 data/

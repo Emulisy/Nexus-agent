@@ -1,12 +1,12 @@
 /**
- * 集成中心 —— 「MCP Server」与「A2A 远程 Agent」两个区块上下排列。
- *
- * 职责：
- * 1. MCP Server：CRUD（args/env/headers 等 JSON 字段提交前解析校验）、同步工具、
- *    健康检查，以及基于 tools_cache 的工具手动调试；
- * 2. A2A 远程 Agent：注册（后端先拉名片验活）、健康检查、任务委派与删除；
- * 3. 对 tools_cache / card 等后端结构做宽容处理，字段缺失或结构变化时降级展示。
+ * MCP and A2A integration management with discovery, health probes, and
+ * manual invocation tools. Editor JSON fields are parsed before submission,
+ * while tools_cache and Agent Cards are inspected defensively because remote
+ * services can return incomplete or unfamiliar structures. Each modal owns a
+ * separate draft/output state, and mutations reload the shared resource lists.
  */
+import '@/styles/management.css';
+import { Icon } from '@/components/ui/Icon';
 import { useEffect, useRef, useState } from 'react';
 import {
   callMCPTool,
@@ -41,19 +41,20 @@ import { errMsg } from '@/lib/request';
 import { toast } from '@/stores/ui';
 import type { A2AAgent, MCPServer } from '@/types/admin';
 
-/* ---- 常量与工具 ---- */
-
-/** 传输方式 → 徽标色调（未知传输回退灰色） */
+/** Badge tones for known MCP transports; unknown values use the render fallback. */
 const TRANSPORT_TONE: Record<string, 'lime' | 'teal' | 'violet'> = {
   streamable_http: 'lime',
   stdio: 'teal',
   sse: 'violet',
 };
 
-/** 传输方式选项（与后端 MCPServer.transport 枚举一致） */
+/** Transport identifiers accepted by the editor and backend MCP registration. */
 const TRANSPORTS = ['streamable_http', 'stdio', 'sse'] as const;
 
-/** 解析 JSON 文本：空串回退默认值，非法返回 null（由调用方 toast 阻断提交） */
+/**
+ * Parse a JSON text field or use its supplied default when blank. The generic
+ * type is a compile-time assertion; callers perform any additional shape checks.
+ */
 function parseJson<T>(text: string, fallback: T): T | null {
   const t = text.trim();
   if (!t) return fallback;
@@ -64,12 +65,13 @@ function parseJson<T>(text: string, fallback: T): T | null {
   }
 }
 
-/** 结果输出统一截断，避免超长响应撑爆弹窗 */
+/** Bound diagnostic output so a remote response cannot create an unbounded modal preview. */
 const clip = (s: string) => truncate(s, 2000);
 
-/* ---- 表单草稿类型 ---- */
-
-/** MCP 表单草稿：三个 JSON 字段以文本承载，提交时统一解析校验 */
+/**
+ * Keep args/env/headers as editable JSON text. Parsing is deferred until
+ * submission so temporarily incomplete input remains editable.
+ */
 interface McpDraft {
   name: string;
   transport: string;
@@ -91,38 +93,37 @@ const EMPTY_MCP: McpDraft = {
 };
 
 export function IntegrationsPage() {
-  /* ---- 列表数据与全局状态 ---- */
   const [servers, setServers] = useState<MCPServer[]>([]);
   const [agents, setAgents] = useState<A2AAgent[]>([]);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [deleting, setDeleting] = useState(false);
-  /** 行内动作（同步 / 健康检查）进行中的目标 id，用于禁用对应按钮 */
+  /** Track the row running a sync or health probe for button feedback. */
   const [busyId, setBusyId] = useState<number | null>(null);
 
-  /* ---- MCP 表单 ---- */
+  /** MCP editor state remains separate from discovery diagnostics. */
   const [mcpOpen, setMcpOpen] = useState(false);
   const [editingMcp, setEditingMcp] = useState<MCPServer | null>(null);
   const [mcpDraft, setMcpDraft] = useState<McpDraft>(EMPTY_MCP);
 
-  /* ---- MCP 工具调试 ---- */
+  /** Tool diagnostics retain their own input and bounded output. */
   const [debugServer, setDebugServer] = useState<MCPServer | null>(null);
   const [debugTool, setDebugTool] = useState('');
   const [debugArgs, setDebugArgs] = useState('{}');
   const [debugOutput, setDebugOutput] = useState('');
   const [debugRunning, setDebugRunning] = useState(false);
 
-  /* ---- A2A 注册 ---- */
+  /** A2A registration uses a fresh URL/name draft. */
   const [registerOpen, setRegisterOpen] = useState(false);
   const [regDraft, setRegDraft] = useState({ base_url: '', name: '' });
 
-  /* ---- A2A 委派任务 ---- */
+  /** Delegation results stay local to the selected remote agent dialog. */
   const [taskAgent, setTaskAgent] = useState<A2AAgent | null>(null);
   const [taskText, setTaskText] = useState('');
   const [taskResult, setTaskResult] = useState('');
   const [taskRunning, setTaskRunning] = useState(false);
 
-  /** 删除目标：kind 区分区块，label 用于确认文案 */
+  /** Kind distinguishes MCP server deletion from A2A registration deletion. */
   const [delTarget, setDelTarget] = useState<{
     kind: 'mcp' | 'a2a';
     id: number;
@@ -131,9 +132,10 @@ export function IntegrationsPage() {
 
   const rootRef = useRef<HTMLDivElement>(null);
 
-  /* ---- 数据加载 ---- */
-
-  /** 并行拉取 MCP Server + A2A Agent；写操作成功后复用整体刷新 */
+  /**
+   * Refresh MCP and A2A catalogs concurrently after writes or health/discovery
+   * actions. Cached remote metadata may change along with the resource list.
+   */
   const load = async () => {
     setLoading(true);
     try {
@@ -151,7 +153,10 @@ export function IntegrationsPage() {
     void load();
   }, []);
 
-  /** 首屏数据就绪后两个区块交错入场（仅首次，后续刷新不重播） */
+  /**
+   * Run section entry motion after the first load only; subsequent list refreshes
+   * should not replay the entire integration page entrance.
+   */
   const playedRef = useRef(false);
   useEffect(() => {
     if (loading || playedRef.current) return;
@@ -160,19 +165,22 @@ export function IntegrationsPage() {
     if (sections && sections.length > 0) staggerEnter(Array.from(sections));
   }, [loading]);
 
-  /* ---- MCP：新增 / 编辑 ---- */
-
+  /** Merge one or more draft fields while preserving the other transport settings. */
   const patchMcp = (patch: Partial<McpDraft>) => setMcpDraft((d) => ({ ...d, ...patch }));
 
+  /** Start from empty remote/process settings and valid empty JSON containers. */
   const openMcpCreate = () => {
     setEditingMcp(null);
     setMcpDraft(EMPTY_MCP);
     setMcpOpen(true);
   };
 
+  /**
+   * Copy an existing transport into the editor and pretty-print its JSON
+   * fields. Absent values use empty containers suitable for editing.
+   */
   const openMcpEdit = (s: MCPServer) => {
     setEditingMcp(s);
-    // JSON 字段序列化为缩进文本便于编辑；结构异常时回退默认值
     setMcpDraft({
       name: s.name,
       transport: s.transport,
@@ -185,25 +193,29 @@ export function IntegrationsPage() {
     setMcpOpen(true);
   };
 
+  /**
+   * Require a name, parse JSON fields, and enforce an array for args before
+   * submitting. Remaining transport-specific validation belongs to the backend.
+   * Successful writes close the dialog and refresh discovery/health metadata.
+   */
   const submitMcp = async () => {
     if (!mcpDraft.name.trim()) {
-      toast.err('名称为必填项');
+      toast.err('Name is required');
       return;
     }
-    // JSON 字段提交前统一解析，任一非法即阻断（args=字符串数组，env/headers=对象）
     const args = parseJson<string[]>(mcpDraft.args, []);
     if (!args || !Array.isArray(args)) {
-      toast.err('args 不是合法的 JSON 数组');
+      toast.err('args must be a valid JSON array');
       return;
     }
     const env = parseJson<Record<string, string>>(mcpDraft.env, {});
     if (!env) {
-      toast.err('env 不是合法的 JSON 对象');
+      toast.err('env must be a valid JSON object');
       return;
     }
     const headers = parseJson<Record<string, string>>(mcpDraft.headers, {});
     if (!headers) {
-      toast.err('headers 不是合法的 JSON 对象');
+      toast.err('headers must be a valid JSON object');
       return;
     }
     setSaving(true);
@@ -219,10 +231,10 @@ export function IntegrationsPage() {
       };
       if (editingMcp) {
         await updateMCPServer(editingMcp.id, payload);
-        toast.ok('MCP Server 已更新');
+        toast.ok('MCP server updated');
       } else {
         await createMCPServer(payload);
-        toast.ok('MCP Server 已创建');
+        toast.ok('MCP server created');
       }
       setMcpOpen(false);
       await load();
@@ -233,15 +245,15 @@ export function IntegrationsPage() {
     }
   };
 
-  /* ---- MCP：行内动作 ---- */
-
-  /** 同步工具清单：toast 展示同步数量后刷新列表 */
+  /**
+   * Disable the target row while remote tool discovery runs, report its count,
+   * and reload the persisted tool-cache view after success.
+   */
   const handleSync = async (s: MCPServer) => {
     setBusyId(s.id);
     try {
       const res = await syncMCPServer(s.id);
-      // synced 字段可能缺省，兜底 0
-      toast.ok(`已同步 ${res.synced ?? 0} 个工具`);
+      toast.ok(`Synced ${res.synced ?? 0} tools`);
       await load();
     } catch (e) {
       toast.err(errMsg(e));
@@ -250,11 +262,12 @@ export function IntegrationsPage() {
     }
   };
 
+  /** Probe one MCP server and refresh its stored status/last-health timestamp. */
   const handleMcpHealth = async (s: MCPServer) => {
     setBusyId(s.id);
     try {
       const res = await checkMCPServer(s.id);
-      toast.ok(`健康检查完成：${res.status}`);
+      toast.ok(`Health check complete: ${res.status}`);
       await load();
     } catch (e) {
       toast.err(errMsg(e));
@@ -263,8 +276,7 @@ export function IntegrationsPage() {
     }
   };
 
-  /* ---- MCP：工具调试 ---- */
-
+  /** Bind the diagnostic dialog to one server and clear prior tool/input/output state. */
   const openDebug = (s: MCPServer) => {
     setDebugServer(s);
     setDebugTool('');
@@ -272,11 +284,14 @@ export function IntegrationsPage() {
     setDebugOutput('');
   };
 
-  /** 执行工具调试：args 非法 JSON 时阻断并提示 */
+  /**
+   * Parse the argument text before invoking the chosen remote tool. Remote
+   * output is formatted and clipped for inspection without changing the server cache.
+   */
   const runDebug = async () => {
     if (!debugServer) return;
     if (!debugTool.trim()) {
-      toast.err('请选择或输入工具名');
+      toast.err('Please select or enter a tool name');
       return;
     }
     let args: Record<string, unknown> = {};
@@ -285,7 +300,7 @@ export function IntegrationsPage() {
       try {
         args = JSON.parse(text) as Record<string, unknown>;
       } catch {
-        toast.err('参数不是合法的 JSON');
+        toast.err('Arguments must be valid JSON');
         return;
       }
     }
@@ -300,7 +315,10 @@ export function IntegrationsPage() {
     }
   };
 
-  // 宽容解析 tools_cache：元素结构不确定，逐项尝试取 name 字段；取不到则退化为手动输入
+  /**
+   * Extract only valid name strings from open-shape discovery records. An empty
+   * result leaves the diagnostic UI with manual tool-name entry.
+   */
   const toolNames =
     debugServer && Array.isArray(debugServer.tools_cache)
       ? debugServer.tools_cache
@@ -308,21 +326,23 @@ export function IntegrationsPage() {
           .filter((n): n is string => typeof n === 'string' && n.length > 0)
       : [];
 
-  /* ---- A2A：注册 / 健康检查 / 委派任务 ---- */
-
+  /**
+   * Require the remote Base URL and omit a blank display name so discovery can
+   * supply it. Clear the successful registration draft before reloading the catalog.
+   */
   const submitRegister = async () => {
     if (!regDraft.base_url.trim()) {
-      toast.err('Base URL 为必填项');
+      toast.err('Base URL is required');
       return;
     }
     setSaving(true);
     try {
-      // name 留空时不传，由后端注册时从 Agent Card 名片取
+      // Omit an empty name so the backend uses the Agent Card name.
       const payload: { base_url: string; name?: string } = { base_url: regDraft.base_url.trim() };
       const name = regDraft.name.trim();
       if (name) payload.name = name;
       await registerA2AAgent(payload);
-      toast.ok('远程 Agent 已注册');
+      toast.ok('Remote agent registered');
       setRegisterOpen(false);
       setRegDraft({ base_url: '', name: '' });
       await load();
@@ -333,11 +353,12 @@ export function IntegrationsPage() {
     }
   };
 
+  /** Probe one remote agent and refresh its persisted health snapshot. */
   const handleAgentHealth = async (a: A2AAgent) => {
     setBusyId(a.id);
     try {
       const res = await checkA2AAgent(a.id);
-      toast.ok(`健康检查完成：${res.status}`);
+      toast.ok(`Health check complete: ${res.status}`);
       await load();
     } catch (e) {
       toast.err(errMsg(e));
@@ -346,16 +367,21 @@ export function IntegrationsPage() {
     }
   };
 
+  /** Start a fresh text delegation dialog for the chosen remote agent. */
   const openTask = (a: A2AAgent) => {
     setTaskAgent(a);
     setTaskText('');
     setTaskResult('');
   };
 
+  /**
+   * Send trimmed task text through the registered A2A endpoint and retain a
+   * bounded JSON result in the dialog for inspection.
+   */
   const submitTask = async () => {
     if (!taskAgent) return;
     if (!taskText.trim()) {
-      toast.err('请输入任务内容');
+      toast.err('Please enter task content');
       return;
     }
     setTaskRunning(true);
@@ -369,15 +395,17 @@ export function IntegrationsPage() {
     }
   };
 
-  /* ---- 删除 ---- */
-
+  /**
+   * Use the target kind to remove an MCP server or A2A registration from the
+   * same confirmation flow, then reload both integration catalogs.
+   */
   const confirmDelete = async () => {
     if (!delTarget) return;
     setDeleting(true);
     try {
       if (delTarget.kind === 'mcp') await deleteMCPServer(delTarget.id);
       else await deleteA2AAgent(delTarget.id);
-      toast.ok('删除成功');
+      toast.ok('Deleted successfully');
       setDelTarget(null);
       await load();
     } catch (e) {
@@ -388,10 +416,10 @@ export function IntegrationsPage() {
   };
 
   return (
-    <div ref={rootRef} className="page-container">
+    <div ref={rootRef} className="page-container management-page">
       <PageHeader
-        title="集成中心"
-        desc="接入外部能力：MCP 工具服务与 A2A 远程智能体，支持健康检查与在线调试"
+        title="Integrations"
+        desc="Connect MCP tool servers and A2A remote agents, with health checks and live debugging."
       />
 
       {loading ? (
@@ -400,41 +428,40 @@ export function IntegrationsPage() {
         </div>
       ) : (
         <div className="space-y-6">
-          {/* 区块一：MCP Server */}
           <section className="panel overflow-hidden">
-            <div className="flex items-center justify-between border-b border-smoke/60 px-4 py-3">
+            <div className="management-section-header flex flex-wrap items-center justify-between gap-3 border-b border-smoke/70 px-5 py-4">
               <h2 className="section-title">MCP Server</h2>
-              <Button onClick={openMcpCreate}>＋ 新增 MCP Server</Button>
+              <Button onClick={openMcpCreate}>＋ Add MCP server</Button>
             </div>
             {servers.length === 0 ? (
               <EmptyState
-                title="暂无 MCP Server"
-                hint="接入 MCP 工具服务后，Agent 即可调用其暴露的工具"
-                action={<Button onClick={openMcpCreate}>新增 MCP Server</Button>}
+                icon={<Icon name="integrations" className="h-6 w-6" />}
+                title="No MCP servers yet"
+                hint="Connect an MCP server to make its tools available to agents."
+                action={<Button onClick={openMcpCreate}>Add MCP server</Button>}
               />
             ) : (
               <div className="overflow-x-auto">
-                <table className="w-full text-left text-sm">
+                <table className="management-table w-full min-w-[800px] text-left text-sm">
                   <thead>
-                    <tr className="border-b border-smoke/60 text-xs text-ash">
-                      <th className="px-4 py-2.5 font-medium">名称</th>
-                      <th className="px-4 py-2.5 font-medium">传输</th>
-                      <th className="px-4 py-2.5 font-medium">端点</th>
-                      <th className="px-4 py-2.5 font-medium">状态</th>
-                      <th className="px-4 py-2.5 font-medium">工具数</th>
-                      <th className="px-4 py-2.5 font-medium">最近健康检查</th>
-                      <th className="px-4 py-2.5 text-right font-medium">操作</th>
+                    <tr className="border-b border-smoke bg-graphite/70 text-xs text-fog">
+                      <th className="px-4 py-3.5 font-medium">Name</th>
+                      <th className="px-4 py-3.5 font-medium">Transport</th>
+                      <th className="px-4 py-3.5 font-medium">Endpoint</th>
+                      <th className="px-4 py-3.5 font-medium">Status</th>
+                      <th className="px-4 py-3.5 font-medium">Tools</th>
+                      <th className="px-4 py-3.5 font-medium">Last health check</th>
+                      <th className="px-4 py-3.5 text-right font-medium">Actions</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-smoke/40">
                     {servers.map((s) => (
-                      <tr key={s.id} className="transition-colors hover:bg-graphite/40">
-                        <td className="px-4 py-2.5 text-bone">{s.name}</td>
-                        <td className="px-4 py-2.5">
+                      <tr key={s.id} className="transition-colors hover:bg-graphite/60">
+                        <td className="px-4 py-3.5 text-bone">{s.name}</td>
+                        <td className="px-4 py-3.5">
                           <Badge tone={TRANSPORT_TONE[s.transport] ?? 'gray'}>{s.transport}</Badge>
                         </td>
-                        {/* stdio 展示 command，远程传输展示 url */}
-                        <td className="px-4 py-2.5">
+                        <td className="px-4 py-3.5">
                           <span
                             className="block max-w-[220px] truncate font-mono text-xs text-fog"
                             title={s.command || s.url}
@@ -442,49 +469,48 @@ export function IntegrationsPage() {
                             {s.command || s.url || '—'}
                           </span>
                         </td>
-                        <td className="px-4 py-2.5">
+                        <td className="px-4 py-3.5">
                           <StatusBadge status={s.status} />
                         </td>
-                        <td className="px-4 py-2.5 font-mono text-xs text-fog">
-                          {/* tools_cache 结构不确定，仅计数展示 */}
+                        <td className="px-4 py-3.5 font-mono text-xs text-fog">
                           {Array.isArray(s.tools_cache) ? s.tools_cache.length : 0}
                         </td>
-                        <td className="px-4 py-2.5 text-xs text-fog">
+                        <td className="px-4 py-3.5 text-xs text-fog">
                           {relativeTime(s.last_health_at) || '—'}
                         </td>
-                        <td className="px-4 py-2.5">
+                        <td className="px-4 py-3.5">
                           <div className="flex justify-end gap-3 whitespace-nowrap text-xs">
                             <button
                               disabled={busyId === s.id}
                               className="text-ash transition-colors hover:text-lime disabled:opacity-40"
                               onClick={() => void handleSync(s)}
                             >
-                              同步工具
+                              Sync tools
                             </button>
                             <button
                               disabled={busyId === s.id}
                               className="text-ash transition-colors hover:text-lime disabled:opacity-40"
                               onClick={() => void handleMcpHealth(s)}
                             >
-                              健康检查
+                              Health check
                             </button>
                             <button
                               className="text-ash transition-colors hover:text-lime"
                               onClick={() => openDebug(s)}
                             >
-                              调试
+                              Debug
                             </button>
                             <button
                               className="text-ash transition-colors hover:text-lime"
                               onClick={() => openMcpEdit(s)}
                             >
-                              编辑
+                              Edit
                             </button>
                             <button
                               className="text-ash transition-colors hover:text-coral"
                               onClick={() => setDelTarget({ kind: 'mcp', id: s.id, label: s.name })}
                             >
-                              删除
+                              Delete
                             </button>
                           </div>
                         </td>
@@ -496,36 +522,36 @@ export function IntegrationsPage() {
             )}
           </section>
 
-          {/* 区块二：A2A 远程 Agent */}
           <section className="panel overflow-hidden">
-            <div className="flex items-center justify-between border-b border-smoke/60 px-4 py-3">
-              <h2 className="section-title">A2A 远程 Agent</h2>
-              <Button onClick={() => setRegisterOpen(true)}>＋ 注册远程 Agent</Button>
+            <div className="management-section-header flex flex-wrap items-center justify-between gap-3 border-b border-smoke/70 px-5 py-4">
+              <h2 className="section-title">A2A remote agents</h2>
+              <Button onClick={() => setRegisterOpen(true)}>＋ Register remote agent</Button>
             </div>
             {agents.length === 0 ? (
               <EmptyState
-                title="暂无远程 Agent"
-                hint="注册 A2A 远程 Agent 后，可将任务委派给其协作完成"
-                action={<Button onClick={() => setRegisterOpen(true)}>注册远程 Agent</Button>}
+                icon={<Icon name="agent" className="h-6 w-6" />}
+                title="No remote agents yet"
+                hint="Register an A2A remote agent to delegate tasks to it."
+                action={<Button onClick={() => setRegisterOpen(true)}>Register remote agent</Button>}
               />
             ) : (
               <div className="overflow-x-auto">
-                <table className="w-full text-left text-sm">
+                <table className="management-table w-full min-w-[800px] text-left text-sm">
                   <thead>
-                    <tr className="border-b border-smoke/60 text-xs text-ash">
-                      <th className="px-4 py-2.5 font-medium">名称</th>
-                      <th className="px-4 py-2.5 font-medium">Base URL</th>
-                      <th className="px-4 py-2.5 font-medium">状态</th>
-                      <th className="px-4 py-2.5 font-medium">名片摘要</th>
-                      <th className="px-4 py-2.5 font-medium">最近健康检查</th>
-                      <th className="px-4 py-2.5 text-right font-medium">操作</th>
+                    <tr className="border-b border-smoke bg-graphite/70 text-xs text-fog">
+                      <th className="px-4 py-3.5 font-medium">Name</th>
+                      <th className="px-4 py-3.5 font-medium">Base URL</th>
+                      <th className="px-4 py-3.5 font-medium">Status</th>
+                      <th className="px-4 py-3.5 font-medium">Agent card</th>
+                      <th className="px-4 py-3.5 font-medium">Last health check</th>
+                      <th className="px-4 py-3.5 text-right font-medium">Actions</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-smoke/40">
                     {agents.map((a) => (
-                      <tr key={a.id} className="transition-colors hover:bg-graphite/40">
-                        <td className="px-4 py-2.5 text-bone">{a.name}</td>
-                        <td className="px-4 py-2.5">
+                      <tr key={a.id} className="transition-colors hover:bg-graphite/60">
+                        <td className="px-4 py-3.5 text-bone">{a.name}</td>
+                        <td className="px-4 py-3.5">
                           <span
                             className="block max-w-[220px] truncate font-mono text-xs text-fog"
                             title={a.base_url}
@@ -533,15 +559,14 @@ export function IntegrationsPage() {
                             {a.base_url}
                           </span>
                         </td>
-                        <td className="px-4 py-2.5">
+                        <td className="px-4 py-3.5">
                           <StatusBadge status={a.status} />
                         </td>
-                        <td className="px-4 py-2.5">
-                          {/* card 名片结构宽容处理：缺失或字段缺失时降级展示 */}
+                        <td className="px-4 py-3.5">
                           {a.card ? (
                             <div className="min-w-0">
                               <p className="max-w-[240px] truncate text-xs text-mist">
-                                {(a.card as { name?: string }).name || '未命名'}
+                                {(a.card as { name?: string }).name || 'Untitled'}
                               </p>
                               <p className="max-w-[240px] truncate text-xs text-ash">
                                 {(a.card as { description?: string }).description ?? ''}
@@ -551,29 +576,29 @@ export function IntegrationsPage() {
                             <span className="text-xs text-ash">—</span>
                           )}
                         </td>
-                        <td className="px-4 py-2.5 text-xs text-fog">
+                        <td className="px-4 py-3.5 text-xs text-fog">
                           {relativeTime(a.last_health_at) || '—'}
                         </td>
-                        <td className="px-4 py-2.5">
+                        <td className="px-4 py-3.5">
                           <div className="flex justify-end gap-3 whitespace-nowrap text-xs">
                             <button
                               disabled={busyId === a.id}
                               className="text-ash transition-colors hover:text-lime disabled:opacity-40"
                               onClick={() => void handleAgentHealth(a)}
                             >
-                              健康检查
+                              Health check
                             </button>
                             <button
                               className="text-ash transition-colors hover:text-lime"
                               onClick={() => openTask(a)}
                             >
-                              委派任务
+                              Delegate task
                             </button>
                             <button
                               className="text-ash transition-colors hover:text-coral"
                               onClick={() => setDelTarget({ kind: 'a2a', id: a.id, label: a.name })}
                             >
-                              删除
+                              Delete
                             </button>
                           </div>
                         </td>
@@ -587,35 +612,34 @@ export function IntegrationsPage() {
         </div>
       )}
 
-      {/* 新增 / 编辑 MCP Server */}
       <Modal
         open={mcpOpen}
-        title={editingMcp ? '编辑 MCP Server' : '新增 MCP Server'}
+        title={editingMcp ? 'Edit MCP server' : 'Add MCP server'}
         onClose={() => setMcpOpen(false)}
         width="max-w-2xl"
         footer={
           <>
             <Button variant="ghost" onClick={() => setMcpOpen(false)}>
-              取消
+              Cancel
             </Button>
             <Button loading={saving} onClick={() => void submitMcp()}>
-              保存
+              Save
             </Button>
           </>
         }
       >
         <div className="space-y-3">
-          <div className="grid grid-cols-2 gap-3">
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
             <div>
-              <label className="field-label">名称 *</label>
+              <label className="field-label">Name *</label>
               <Input
                 value={mcpDraft.name}
-                placeholder="如 filesystem"
+                placeholder="e.g. filesystem"
                 onChange={(e) => patchMcp({ name: e.target.value })}
               />
             </div>
             <div>
-              <label className="field-label">传输方式</label>
+              <label className="field-label">Transport</label>
               <Select
                 value={mcpDraft.transport}
                 onChange={(e) => patchMcp({ transport: e.target.value })}
@@ -629,23 +653,23 @@ export function IntegrationsPage() {
             </div>
           </div>
           <div>
-            <label className="field-label">URL（streamable_http / sse）</label>
+            <label className="field-label">URL (streamable_http / sse)</label>
             <Input
               value={mcpDraft.url}
-              placeholder="如 https://mcp.example.com/mcp"
+              placeholder="e.g. https://mcp.example.com/mcp"
               onChange={(e) => patchMcp({ url: e.target.value })}
             />
           </div>
           <div>
-            <label className="field-label">Command（stdio）</label>
+            <label className="field-label">Command (stdio)</label>
             <Input
               value={mcpDraft.command}
-              placeholder="如 npx -y @modelcontextprotocol/server-filesystem /tmp"
+              placeholder="e.g. npx -y @modelcontextprotocol/server-filesystem /tmp"
               onChange={(e) => patchMcp({ command: e.target.value })}
             />
           </div>
           <div>
-            <label className="field-label">args（JSON 数组）</label>
+            <label className="field-label">Arguments (JSON array)</label>
             <Textarea
               rows={2}
               className="font-mono"
@@ -653,9 +677,9 @@ export function IntegrationsPage() {
               onChange={(e) => patchMcp({ args: e.target.value })}
             />
           </div>
-          <div className="grid grid-cols-2 gap-3">
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
             <div>
-              <label className="field-label">env（JSON 对象）</label>
+              <label className="field-label">Environment (JSON object)</label>
               <Textarea
                 rows={3}
                 className="font-mono"
@@ -664,7 +688,7 @@ export function IntegrationsPage() {
               />
             </div>
             <div>
-              <label className="field-label">headers（JSON 对象）</label>
+              <label className="field-label">Headers (JSON object)</label>
               <Textarea
                 rows={3}
                 className="font-mono"
@@ -676,30 +700,28 @@ export function IntegrationsPage() {
         </div>
       </Modal>
 
-      {/* MCP 工具调试 */}
       <Modal
         open={debugServer !== null}
-        title={`工具调试 · ${debugServer?.name ?? ''}`}
+        title={`Tool debugger · ${debugServer?.name ?? ''}`}
         onClose={() => setDebugServer(null)}
         width="max-w-xl"
         footer={
           <>
             <Button variant="ghost" onClick={() => setDebugServer(null)}>
-              关闭
+              Close
             </Button>
             <Button loading={debugRunning} onClick={() => void runDebug()}>
-              执行
+              Run
             </Button>
           </>
         }
       >
         <div className="space-y-3">
           <div>
-            <label className="field-label">工具名</label>
+            <label className="field-label">Tool name</label>
             {toolNames.length > 0 ? (
-              // tools_cache 中解析出工具名 → 下拉选择
               <Select value={debugTool} onChange={(e) => setDebugTool(e.target.value)}>
-                <option value="">请选择工具</option>
+                <option value="">Select a tool</option>
                 {toolNames.map((n) => (
                   <option key={n} value={n}>
                     {n}
@@ -707,16 +729,15 @@ export function IntegrationsPage() {
                 ))}
               </Select>
             ) : (
-              // 解析不到工具名 → 退化为手动输入
               <Input
                 value={debugTool}
-                placeholder="tools_cache 中未解析出工具名，请手动输入"
+                placeholder="No tool names found in the cache. Enter a tool name."
                 onChange={(e) => setDebugTool(e.target.value)}
               />
             )}
           </div>
           <div>
-            <label className="field-label">参数（JSON）</label>
+            <label className="field-label">Parameters (JSON)</label>
             <Textarea
               rows={4}
               className="font-mono"
@@ -726,25 +747,24 @@ export function IntegrationsPage() {
           </div>
           {debugOutput && (
             <div>
-              <label className="field-label">输出</label>
+              <label className="field-label">Output</label>
               <pre className="code-block max-h-64 whitespace-pre-wrap">{debugOutput}</pre>
             </div>
           )}
         </div>
       </Modal>
 
-      {/* 注册远程 Agent */}
       <Modal
         open={registerOpen}
-        title="注册远程 Agent"
+        title="Register remote agent"
         onClose={() => setRegisterOpen(false)}
         footer={
           <>
             <Button variant="ghost" onClick={() => setRegisterOpen(false)}>
-              取消
+              Cancel
             </Button>
             <Button loading={saving} onClick={() => void submitRegister()}>
-              注册
+              Register
             </Button>
           </>
         }
@@ -754,68 +774,66 @@ export function IntegrationsPage() {
             <label className="field-label">Base URL *</label>
             <Input
               value={regDraft.base_url}
-              placeholder="如 https://agent.example.com"
+              placeholder="e.g. https://agent.example.com"
               onChange={(e) => setRegDraft((d) => ({ ...d, base_url: e.target.value }))}
             />
           </div>
           <div>
-            <label className="field-label">名称（可选）</label>
+            <label className="field-label">Name (optional)</label>
             <Input
               value={regDraft.name}
-              placeholder="留空则自动取名片名称；注册时会拉取 /.well-known/agent.json 验活"
+              placeholder="Leave blank to use the agent card name. Registration checks /.well-known/agent.json."
               onChange={(e) => setRegDraft((d) => ({ ...d, name: e.target.value }))}
             />
           </div>
         </div>
       </Modal>
 
-      {/* A2A 委派任务 */}
       <Modal
         open={taskAgent !== null}
-        title={`委派任务 · ${taskAgent?.name ?? ''}`}
+        title={`Delegate task · ${taskAgent?.name ?? ''}`}
         onClose={() => setTaskAgent(null)}
         width="max-w-xl"
         footer={
           <>
             <Button variant="ghost" onClick={() => setTaskAgent(null)}>
-              关闭
+              Close
             </Button>
             <Button loading={taskRunning} onClick={() => void submitTask()}>
-              发送任务
+              Send task
             </Button>
           </>
         }
       >
         <div className="space-y-3">
           <div>
-            <label className="field-label">任务内容</label>
+            <label className="field-label">Task</label>
             <Textarea
               rows={4}
               value={taskText}
-              placeholder="用自然语言描述要委派给该 Agent 的任务"
+              placeholder="Describe the task to delegate to this agent"
               onChange={(e) => setTaskText(e.target.value)}
             />
           </div>
           {taskResult && (
             <div>
-              <label className="field-label">执行结果</label>
+              <label className="field-label">Result</label>
               <pre className="code-block max-h-64 whitespace-pre-wrap">{taskResult}</pre>
             </div>
           )}
         </div>
       </Modal>
 
-      {/* 删除二次确认 */}
       <ConfirmDialog
         open={delTarget !== null}
-        title={delTarget?.kind === 'mcp' ? '删除 MCP Server' : '删除远程 Agent'}
+        title={delTarget?.kind === 'mcp' ? 'Delete MCP server' : 'Delete remote agent'}
         content={
           delTarget
-            ? `确认删除「${delTarget.label}」？该操作不可恢复。`
+            ? `Delete “${delTarget.label}”? This cannot be undone.`
             : ''
         }
         danger
-        confirmText="删除"
+        confirmText="Delete"
         loading={deleting}
         onCancel={() => setDelTarget(null)}
         onConfirm={() => void confirmDelete()}

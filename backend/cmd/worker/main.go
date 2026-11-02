@@ -1,8 +1,7 @@
-// NexusAgent 异步任务 Worker 入口：独立进程消费 Redis Streams。
-//
-// 为什么独立进程（教学点）：
-//   - ETL/评估是 CPU/IO 密集任务，与 API 进程隔离避免互相拖累
-//   - 独立伸缩：文档上传高峰时只扩 worker 副本
+// Command worker consumes document ETL jobs independently of the HTTP server.
+// It uses the same database, vector store, encryption key, and model resolution
+// as the API process. Redis stream consumption ends when the signal handler
+// cancels the worker context.
 package main
 
 import (
@@ -15,16 +14,16 @@ import (
 	"github.com/chengpeng-cp/nexus-agent/internal/config"
 	"github.com/chengpeng-cp/nexus-agent/internal/infra"
 	"github.com/chengpeng-cp/nexus-agent/internal/llm"
-	"github.com/chengpeng-cp/nexus-agent/internal/observability"
-        "github.com/chengpeng-cp/nexus-agent/internal/observability/logger"
-        "github.com/chengpeng-cp/nexus-agent/internal/security"
+	"github.com/chengpeng-cp/nexus-agent/internal/logging"
 	"github.com/chengpeng-cp/nexus-agent/internal/rag/engine"
 	"github.com/chengpeng-cp/nexus-agent/internal/repo"
+	"github.com/chengpeng-cp/nexus-agent/internal/security"
 	"github.com/chengpeng-cp/nexus-agent/internal/service"
 	"github.com/chengpeng-cp/nexus-agent/internal/vector"
 	"github.com/chengpeng-cp/nexus-agent/internal/worker"
 )
 
+// main reports worker initialization or processing errors and exits unsuccessfully.
 func main() {
 	if err := run(); err != nil {
 		fmt.Fprintf(os.Stderr, "worker exited: %v\n", err)
@@ -32,17 +31,20 @@ func main() {
 	}
 }
 
+// run creates storage clients and a RAG engine, then starts stream consumption.
+// MinIO construction is optional at this layer; jobs that need stored object
+// content still require a usable object client. Shutdown cancellation is passed
+// to the worker rather than managed through an HTTP server.
 func run() error {
 	cfg, err := config.Load("")
 	if err != nil {
 		return err
 	}
-	logger.Init(cfg.Log.Level, cfg.Log.Format)
+	logging.Init(cfg.Log.Level, cfg.Log.Format)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// 基础设施（API 与 worker 共享同一套存储）
 	db, err := infra.NewPG(ctx, &cfg.PG)
 	if err != nil {
 		return fmt.Errorf("pg: %w", err)
@@ -56,21 +58,20 @@ func run() error {
 		return fmt.Errorf("milvus: %w", err)
 	}
 
-	// RAG 引擎（doc-etl 消费方）
-        gateway := llm.NewGateway(&cfg.LLM)
-        store := vector.NewMilvusStore(mcli)
-        repos := repo.New(db)
+	gateway := llm.NewGateway(&cfg.LLM)
+	store := vector.NewMilvusStore(mcli)
+	repos := repo.New(db)
 
-        // 加密器与 server 同源：模型解析需解密 api_key（缺失会 nil panic）
-        encryptor, err := security.NewEncryptor(cfg.SecretKey)
-        if err != nil {
-                return fmt.Errorf("encryptor: %w", err)
-        }
+	// Use the server master key to decrypt model credentials.
+	encryptor, err := security.NewEncryptor(cfg.SecretKey)
+	if err != nil {
+		return fmt.Errorf("encryptor: %w", err)
+	}
 
-        // 默认模型解析与 server 同源（service.New 仅用于模型解析）
-        svcs, err := service.New(service.Deps{
-                Cfg: cfg, Repos: repos, Gateway: gateway, RDB: rdb, Vector: store, Encryptor: encryptor,
-        })
+	// Reuse service model resolution for document embedding and reranking.
+	svcs, err := service.New(service.Deps{
+		Cfg: cfg, Repos: repos, Gateway: gateway, RDB: rdb, Vector: store, Encryptor: encryptor,
+	})
 	if err != nil {
 		return fmt.Errorf("services: %w", err)
 	}
@@ -78,12 +79,12 @@ func run() error {
 	ragEngine.SetModels(svcs.DefaultEmbedding, svcs.DefaultRerank)
 
 	w := worker.New(rdb, repos, ragEngine, nil, "", &cfg.Worker)
-	// MinIO 可选（本地教学可关闭对象存储，文档内容直传场景）
+	// Object storage is optional when document content is already available inline.
 	if mc, err := infra.NewMinIO(ctx, &cfg.MinIO); err == nil {
 		w = worker.New(rdb, repos, ragEngine, mc, cfg.MinIO.Bucket, &cfg.Worker)
 	}
 
-	observability.LogInfo("nexus-agent worker started",
+	logging.LogInfo("SupaAgent worker started",
 		"concurrency", fmt.Sprint(cfg.Worker.Concurrency), "stream", worker.StreamDocETL)
 
 	quit := make(chan os.Signal, 1)

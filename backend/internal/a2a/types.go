@@ -1,28 +1,27 @@
-// Package a2a A2A（Agent-to-Agent）协议实现（td.md §8.10，Ep 14）。
-//
-// 本文件：协议类型定义（Agent Card / 任务 / 消息）。
-// A2A 是 Google 提出的 Agent 互联开放协议：Agent 通过"名片"（Agent Card）
-// 自我描述，通过 JSON-RPC 交换任务（Task）—— MCP 打通"Agent↔工具"，
-// A2A 打通"Agent↔Agent"，二者互补。
+// Package a2a implements discovery and synchronous Agent-to-Agent JSON-RPC calls.
+// The current transport exchanges text parts and completed/failed task results;
+// streamed tasks and non-text media are not implemented by these adapters.
 package a2a
 
-// AgentCard Agent 名片（自描述文档，部署于 /.well-known/agent.json）。
+// AgentCard is the discovery document published at /.well-known/agent.json.
+// Its URL is the JSON-RPC endpoint that outbound clients prefer after discovery.
 type AgentCard struct {
-	Name        string   `json:"name"`                  // Agent 名称
-	Description string   `json:"description"`           // 能力描述（供对方路由决策）
-	URL         string   `json:"url"`                   // JSON-RPC 服务端点
-	Version     string   `json:"version"`               // Agent 版本
-	Protocol    string   `json:"protocolVersion"`       // A2A 协议版本
+	Name         string `json:"name"`
+	Description  string `json:"description"`
+	URL          string `json:"url"`
+	Version      string `json:"version"`
+	Protocol     string `json:"protocolVersion"`
 	Capabilities struct {
-		Streaming bool `json:"streaming"`           // 是否支持流式
+		Streaming bool `json:"streaming"`
 	} `json:"capabilities"`
-	Skills []AgentSkill `json:"skills"`               // 技能清单（路由依据）
+	Skills   []AgentSkill `json:"skills"`
 	Provider struct {
 		Organization string `json:"organization"`
 	} `json:"provider,omitempty"`
 }
 
-// AgentSkill Agent 技能条目。
+// AgentSkill describes a discoverable capability; it does not itself register
+// a handler or select a local Agent implementation.
 type AgentSkill struct {
 	ID          string   `json:"id"`
 	Name        string   `json:"name"`
@@ -30,57 +29,52 @@ type AgentSkill struct {
 	Tags        []string `json:"tags,omitempty"`
 }
 
-// JSON-RPC 方法名（A2A 规范子集）。
 const (
-	MethodMessageSend  = "message/send"   // 发消息（同步任务）
-	MethodMessageProbe = "message/ping"   // 存活探测
-	MethodTasksGet     = "tasks/get"      // 查询任务状态
+	MethodMessageSend  = "message/send"
+	MethodMessageProbe = "message/ping"
 )
 
-// Role 消息角色。
 const (
 	RoleUser  = "user"
 	RoleAgent = "agent"
 )
 
-// Part 消息内容片段（A2A 支持多模态，教学版仅实现 text）。
+// Part represents a message or artifact segment. The client and server process
+// text parts only and ignore other type values when extracting conversational text.
 type Part struct {
-	Type string `json:"type"` // text
+	Type string `json:"type"`
 	Text string `json:"text,omitempty"`
 }
 
-// Message 一条消息。
+// Message carries a role and ordered parts in the A2A wire format, independently
+// of the internal model Message used for database history.
 type Message struct {
 	Role  string `json:"role"`
 	Parts []Part `json:"parts"`
 }
 
-// TaskState 任务状态。
 const (
-	StateSubmitted = "submitted"
-	StateWorking   = "working"
 	StateCompleted = "completed"
 	StateFailed    = "failed"
 )
 
-// Task A2A 任务（message/send 的执行载体）。
+// Task is the synchronous execution result. Successful answers are represented
+// both as an Agent message and as a text artifact by the local server.
 type Task struct {
-	ID        string   `json:"id"`                  // 任务 ID
-	State     string   `json:"status"`              // 任务状态
-	Messages  []Message `json:"messages,omitempty"` // 交互历史
-	Artifacts []Artifact `json:"artifacts,omitempty"` // 产出物
+	ID        string     `json:"id"`
+	State     string     `json:"status"`
+	Messages  []Message  `json:"messages,omitempty"`
+	Artifacts []Artifact `json:"artifacts,omitempty"`
 }
 
-// Artifact 任务产出。
+// Artifact groups generated parts, optionally under a descriptive name.
+// ExtractText reads these parts in response order.
 type Artifact struct {
 	Name  string `json:"name,omitempty"`
 	Parts []Part `json:"parts"`
 }
 
-// SendMessageParams message/send 入参。
+// SendMessageParams is the message/send parameter envelope consumed by RPCHandler.
 type SendMessageParams struct {
-	Message Message `json:"message"` // 用户消息（role 必须 user）
+	Message Message `json:"message"`
 }
-
-// TaskJSONRPC JSON-RPC result 的规范封装（教学简化：直接返回 Task 对象）。
-type TaskJSONRPC = Task

@@ -1,5 +1,3 @@
-// 并发控制：供应商级信号量（td.md §8.1）。
-// 超载时排队等待（带 ctx 超时），防止打爆上游配额。
 package llm
 
 import (
@@ -7,12 +5,13 @@ import (
 	"fmt"
 )
 
-// Semaphore 朴素信号量。
+// Semaphore bounds concurrent guarded operations using buffered channel slots.
+// It is a concurrency limit, not a requests-per-second rate limiter.
 type Semaphore struct {
 	ch chan struct{}
 }
 
-// NewSemaphore 构造容量为 n 的信号量。
+// NewSemaphore creates n slots, defaulting to sixteen for non-positive values.
 func NewSemaphore(n int) *Semaphore {
 	if n <= 0 {
 		n = 16
@@ -20,7 +19,8 @@ func NewSemaphore(n int) *Semaphore {
 	return &Semaphore{ch: make(chan struct{}, n)}
 }
 
-// Acquire 获取配额；ctx 超时/取消时返回错误。
+// Acquire waits for one slot or returns the context error. Callers must release
+// each successfully acquired slot exactly once.
 func (s *Semaphore) Acquire(ctx context.Context) error {
 	select {
 	case s.ch <- struct{}{}:
@@ -30,7 +30,7 @@ func (s *Semaphore) Acquire(ctx context.Context) error {
 	}
 }
 
-// Release 释放配额。
+// Release returns one slot without blocking. An empty semaphore is left unchanged.
 func (s *Semaphore) Release() {
 	select {
 	case <-s.ch:

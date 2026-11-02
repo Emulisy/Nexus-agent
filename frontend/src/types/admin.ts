@@ -1,42 +1,50 @@
 /**
- * 管理域类型 —— 对应 model/llm.go 与 model/agent.go（MCP/A2A）。
- * 仅 admin 角色可访问对应接口。
+ * Administrative resource payloads for model providers, models, MCP servers,
+ * and remote A2A agents. These endpoints require the admin role. Credential
+ * responses contain masked values, while remote discovery payloads remain open
+ * JSON structures so the UI can tolerate missing or additional fields.
  */
-
-/** 模型供应商（APIKey AES-GCM 加密存储，仅回显打码摘要） */
+/**
+ * Provider configuration with public metadata and a masked API-key summary.
+ * Plaintext credentials are accepted only on write requests, not this response.
+ */
 export interface ModelProvider {
   id: number;
-  /** deepseek / qwen / zhipu / moonshot / doubao / ollama */
+  /** Stable provider code used when the backend selects an adapter. */
   code: string;
   name: string;
   base_url: string;
-  /** 打码摘要（前2位+****+后4位）；"" = 未配置 Key */
+  /** Empty when no key is configured; otherwise a masked value. */
   api_key_masked: string;
   status: number;
   created_at: string;
   updated_at: string;
 }
 
-/** 模型类型 */
+/** Backend model categories used by configuration forms and filters. */
 export type ModelType = 'chat' | 'embedding' | 'rerank';
 
-/** 模型配置 */
+/**
+ * A provider-bound model configuration with limits, prices, capability metadata,
+ * and an optional provider projection used by the management table.
+ */
 export interface ModelConfig {
   id: number;
   provider_id: number;
-  /** 上游模型名 */
+  /** Upstream model identifier sent in provider requests. */
   model_name: string;
-  /** 平台展示别名 */
+  /** Optional display alias used ahead of the upstream name in selectors. */
   alias: string;
   type: ModelType;
   context_window: number;
   max_output: number;
-  /** 元 / 1M tokens */
+  /** CNY per million tokens. */
   input_price: number;
+  /** Output-token price in CNY per million tokens. */
   output_price: number;
-  /** 故障转移顺序，小者优先 */
+  /** Lower values sort ahead of other configurations during backend selection. */
   priority: number;
-  /** ["vision","function_call","reasoning"] */
+  /** Provider capability labels such as vision, function_call, and reasoning. */
   capabilities: string[];
   is_default: boolean;
   status: number;
@@ -45,31 +53,34 @@ export interface ModelConfig {
   provider?: ModelProvider;
 }
 
-/** MCP 服务端配置 */
+/**
+ * MCP transport settings plus cached discovery and health information.
+ * URL is used by remote transports; command/args/env configure stdio transports.
+ */
 export interface MCPServer {
   id: number;
   name: string;
-  /** streamable_http / stdio / sse */
+  /** Transport identifier: streamable_http, stdio, or sse. */
   transport: string;
   url: string;
   command: string;
   args: string[];
   env: Record<string, string>;
   headers: Record<string, string>;
-  /** disconnected / connected / error ... */
   status: string;
   last_health_at?: string | null;
+  /** Discovered remote tool definitions; element shapes are checked before display. */
   tools_cache: unknown[];
   created_at: string;
   updated_at: string;
 }
 
-/** A2A 远程 Agent（名片快照在 card 字段） */
+/** Remote agent registration whose card is the last discovered Agent Card snapshot. */
 export interface A2AAgent {
   id: number;
   name: string;
   base_url: string;
-  /** Agent Card（A2A 协议 /.well-known/agent.json） */
+  /** Cached discovery response from the remote Agent Card endpoint. */
   card: Record<string, unknown> | null;
   status: string;
   last_health_at?: string | null;

@@ -1,8 +1,3 @@
-// Docker 沙箱（td.md §8.9，P0 基础版）。
-//
-// 隔离策略：一次性容器 + 无网络 + 资源限额 + 超时强杀 + 输出截断；
-// 代码原文只存 sha256（sandbox_executions 表）。
-// 教学要点（Ep 15）：沙箱是 Agent 安全的最后一道防线，没有隔离的 code_exec 不能上生产。
 package tool
 
 import (
@@ -17,22 +12,23 @@ import (
 	"github.com/docker/docker/pkg/stdcopy"
 )
 
-// SandboxConfig 沙箱配置。
+// SandboxConfig selects the execution image and maximum container runtime.
+// Memory, CPU, PID, and network settings are fixed in Run.
 type SandboxConfig struct {
-	Image     string        // nexus/sandbox:latest
-	Memory    string        // 512m
-	CPUs      string        // "1"
-	Timeout   time.Duration // 30s
-	PoolSize  int
+	Image   string
+	Timeout time.Duration
 }
 
-// Sandbox Docker 沙箱执行器。
+// Sandbox creates a disposable Docker container for each code execution. No
+// network is attached, and fixed memory/CPU/PID limits bound the container. The
+// client honors Docker environment settings rather than assuming a local socket.
 type Sandbox struct {
 	cli *client.Client
 	cfg SandboxConfig
 }
 
-// NewSandbox 连接 Docker（读 DOCKER_HOST 环境变量，默认 /var/run/docker.sock）。
+// NewSandbox creates a Docker client using environment configuration and API
+// version negotiation. Images and daemon availability are checked by later calls.
 func NewSandbox(cfg SandboxConfig) (*Sandbox, error) {
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
@@ -41,7 +37,8 @@ func NewSandbox(cfg SandboxConfig) (*Sandbox, error) {
 	return &Sandbox{cli: cli, cfg: cfg}, nil
 }
 
-// ExecResult 沙箱执行结果。
+// ExecResult contains separated standard output/error, the inspected exit code,
+// and elapsed wall-clock duration. Output is truncated before leaving the sandbox.
 type ExecResult struct {
 	Stdout   string
 	Stderr   string
@@ -49,26 +46,27 @@ type ExecResult struct {
 	Duration time.Duration
 }
 
-// Run 在一次性容器中执行代码。
-// language 决定解释器：python3 / go run / sh。
+// Run selects a supported interpreter, creates and starts one constrained
+// container, waits for exit under a timeout, and collects logs. Deferred removal
+// uses a fresh cleanup context so cancellation does not leave the container behind.
 func (s *Sandbox) Run(ctx context.Context, language, code string) (*ExecResult, error) {
 	start := time.Now()
 
-	// 组装启动命令：每种语言统一为 [解释器, 文件] 或 [sh, -c, code]
 	var cmd []string
 	switch language {
 	case "python":
 		cmd = []string{"python3", "-c", code}
 	case "shell":
 		cmd = []string{"sh", "-c", code}
+	// The Go input must be a complete main package. Code is written inside the
+	// container; no workspace directory is mounted into the execution environment.
 	case "go":
-		// go run 单文件：代码需含 package main
 		cmd = []string{"sh", "-c", fmt.Sprintf("mkdir -p /tmp/x && cat > /tmp/x/main.go <<'NEXUSEOF'\n%s\nNEXUSEOF\ncd /tmp/x && go run main.go", code)}
 	default:
 		return nil, fmt.Errorf("unsupported language: %s", language)
 	}
 
-	// 创建一次性容器：无网络 + 内存/CPU/PID 限额
+	// Bound create/start/wait/log operations with the configured execution deadline.
 	runCtx, cancel := context.WithTimeout(ctx, s.cfg.Timeout)
 	defer cancel()
 
@@ -81,19 +79,21 @@ func (s *Sandbox) Run(ctx context.Context, language, code string) (*ExecResult, 
 			Env:        []string{"GOCACHE=/tmp/gocache", "GOFLAGS=-mod=mod"},
 		},
 		&container.HostConfig{
-			NetworkMode: "none",               // 无网络：最关键的隔离手段
+			// Keep runtime code off the network; dependency downloads are unavailable.
+			NetworkMode: "none",
 			Resources: container.Resources{
-				Memory:    512 * 1024 * 1024, // 512m
-				NanoCPUs:  1e9,               // 1 CPU
-				PidsLimit: int64Ptr(64),      // 防 fork 炸弹
+				Memory:    512 * 1024 * 1024,
+				NanoCPUs:  1e9,
+				PidsLimit: int64Ptr(64),
 			},
 		},
 		nil, nil, "")
 	if err != nil {
 		return nil, fmt.Errorf("container create: %w", err)
 	}
+	// Once a container exists, schedule forced removal for success, error, and timeout.
 	containerID := resp.ID
-	// 无论成败，强制清理
+
 	defer func() {
 		rmCtx, rmCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer rmCancel()
@@ -104,7 +104,6 @@ func (s *Sandbox) Run(ctx context.Context, language, code string) (*ExecResult, 
 		return nil, fmt.Errorf("container start: %w", err)
 	}
 
-	// 等待退出（超时由 runCtx 强杀）
 	statusCh, errCh := s.cli.ContainerWait(runCtx, containerID, container.WaitConditionNotRunning)
 	select {
 	case <-statusCh:
@@ -114,7 +113,6 @@ func (s *Sandbox) Run(ctx context.Context, language, code string) (*ExecResult, 
 		return nil, fmt.Errorf("sandbox timeout (%s)", s.cfg.Timeout)
 	}
 
-	// 拉取日志
 	logs, err := s.cli.ContainerLogs(runCtx, containerID, container.LogsOptions{
 		ShowStdout: true, ShowStderr: true, Follow: false,
 	})
@@ -124,7 +122,8 @@ func (s *Sandbox) Run(ctx context.Context, language, code string) (*ExecResult, 
 	defer logs.Close()
 
 	var stdout, stderr bytes.Buffer
-	// TTY=false 时 stdout/stderr 分流
+
+	// Docker multiplexes non-TTY logs; demultiplex before reporting stdout/stderr.
 	_, _ = stdcopy.StdCopy(&stdout, &stderr, logs)
 
 	inspect, err := s.cli.ContainerInspect(context.Background(), containerID)
@@ -143,7 +142,7 @@ func (s *Sandbox) Run(ctx context.Context, language, code string) (*ExecResult, 
 
 func int64Ptr(v int64) *int64 { return &v }
 
-// truncate 截断输出。
+// truncate limits stored/output bytes and marks omitted content.
 func truncate(s string, max int) string {
 	if len(s) <= max {
 		return s

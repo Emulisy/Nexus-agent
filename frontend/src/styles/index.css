@@ -1,89 +1,159 @@
 @import "tailwindcss";
 @config "../../tailwind.config.js";
 
-/* ============================================================
-   NexusAgent 全局样式 —— 暗色设计系统 + 通用组件层
-   设计语言与 docs/teach-pdf 讲解页一致：
-   四级黑底 × 酸性荧光绿，低饱和灰阶分层
-   ============================================================ */
-
+/**
+ * Global document defaults, selection, and scrollbars. Keep base rules free
+ * of feature selectors so pages share typography without importing each other.
+ */
 @layer base {
-  html,
-  body,
-  #root {
-    @apply h-full;
-  }
+  html, body, #root { height: 100%; }
+  html { color-scheme: light; }
   body {
     @apply bg-void font-sans text-mist antialiased;
+    margin: 0;
+    font-feature-settings: 'ss01', 'cv11';
+    background-image: radial-gradient(ellipse at 6% 0%, #d8e9ff 0%, transparent 42%), radial-gradient(ellipse at 100% 100%, #dcecff 0%, transparent 42%);
   }
-  /* 细滚动条：暗色系必备，避免默认亮色滚动条破坏氛围 */
-  * {
-    scrollbar-width: thin;
-    scrollbar-color: #383b3f transparent;
+  * { scrollbar-width: thin; scrollbar-color: #c5d4e8 transparent; }
+  *::-webkit-scrollbar { width: 5px; height: 5px; }
+  *::-webkit-scrollbar-thumb { border-radius: 99px; background: #c5d4e8; }
+  *::-webkit-scrollbar-track { background: transparent; }
+  ::selection { background: #dceaff; color: #183451; }
+  button, a, input, textarea, select { -webkit-tap-highlight-color: transparent; }
+  button:not(:disabled), select:not(:disabled) { cursor: pointer; }
+  :is(button, a, input, textarea, select):focus-visible { outline: 2px solid #2764e7; outline-offset: 3px; }
+  input[type='checkbox'], input[type='radio'] { accent-color: #2764e7; }
+  input[type='file']::file-selector-button {
+    @apply mr-3 rounded-lg border-0 bg-graphite px-3 py-1.5 text-xs font-medium text-lime;
   }
-  *::-webkit-scrollbar {
-    width: 6px;
-    height: 6px;
-  }
-  *::-webkit-scrollbar-thumb {
-    @apply rounded-full bg-smoke;
-  }
-  *::-webkit-scrollbar-track {
-    background: transparent;
-  }
-  /* 选区颜色用主色，强化品牌记忆 */
-  ::selection {
-    @apply bg-lime/80 text-void;
-  }
+  input, textarea, select { font: inherit; }
+  input::placeholder, textarea::placeholder { opacity: 1; }
+  h1, h2, h3 { text-wrap: balance; }
 }
 
+/**
+ * Shared shell and component classes consumed by the React primitives.
+ * Feature-specific layouts extend these surfaces in their own stylesheets.
+ */
 @layer components {
-  /* 页面容器：统一左右留白与最大宽度 */
-  .page-container {
-    @apply mx-auto w-full max-w-6xl px-6 py-8;
+  /** The outer canvas supplies the desktop frame; mobile rules remove that frame. */
+  .app-canvas {
+    @apply relative flex h-full overflow-hidden p-3 lg:p-5;
+    isolation: isolate;
+    background-image: linear-gradient(rgba(112, 145, 193, 0.055) 1px, transparent 1px), linear-gradient(90deg, rgba(112, 145, 193, 0.055) 1px, transparent 1px);
+    background-size: 48px 48px;
   }
-  /* 面板卡片：obsidian 底 + 细描边，hover 微亮 */
+  .app-canvas::before {
+    content: '';
+    position: absolute;
+    z-index: -1;
+    inset: -20% 30% 45% -10%;
+    background: radial-gradient(ellipse, rgba(176, 208, 255, 0.42), transparent 65%);
+    pointer-events: none;
+  }
+  /** Clip shell decoration while nested feature containers own their scroll areas. */
+  .app-shell {
+    @apply relative flex min-h-0 w-full overflow-hidden rounded-[24px] border border-white/95;
+    background: rgba(255, 255, 255, 0.7);
+    box-shadow: 0 24px 80px -32px rgba(40, 75, 126, 0.22), 0 2px 8px rgba(68, 101, 150, 0.035), inset 0 1px 0 white;
+    backdrop-filter: blur(28px);
+  }
+  .app-sidebar {
+    @apply flex h-full w-[68px] shrink-0 flex-col border-r border-smoke/65 md:w-[208px];
+    background: linear-gradient(165deg, rgba(255, 255, 255, 0.9), rgba(242, 247, 255, 0.56));
+  }
+  .nav-link {
+    @apply relative flex min-h-11 items-center justify-center gap-3 rounded-xl border border-transparent px-3 text-sm text-fog transition-all duration-200 md:justify-start;
+  }
+  .nav-link:hover { background: rgba(255, 255, 255, 0.8); color: #2764e7; }
+  .nav-link-active {
+    @apply border-lime/10 font-medium text-lime;
+    background: linear-gradient(105deg, rgba(228, 239, 255, 0.96), rgba(249, 252, 255, 0.95));
+    box-shadow: 0 3px 8px -5px rgba(50, 94, 173, 0.2), inset 0 1px 0 white;
+  }
+  .app-topbar {
+    @apply flex h-[68px] shrink-0 items-center justify-between gap-3 border-b border-smoke/65 px-5 sm:px-7;
+    background: rgba(255, 255, 255, 0.62);
+    backdrop-filter: blur(20px);
+  }
+  .app-content {
+    @apply relative min-h-0 flex-1 overflow-y-auto overscroll-contain;
+    background: linear-gradient(145deg, rgba(249, 252, 255, 0.5), rgba(240, 246, 255, 0.22));
+  }
+  .brand-mark {
+    @apply relative inline-flex h-9 w-9 shrink-0 items-center justify-center overflow-hidden rounded-xl text-white;
+    background: linear-gradient(145deg, #6198ff 0%, #2b6be8 48%, #2052bc 100%);
+    box-shadow: inset 0 1px 1px rgba(255, 255, 255, 0.65), 0 4px 12px -4px rgba(39, 100, 231, 0.4);
+  }
+  .brand-mark::after {
+    content: '';
+    position: absolute;
+    inset: 3px;
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    border-radius: 9px;
+  }
+  .page-container { @apply mx-auto w-full max-w-6xl px-5 py-8 sm:px-8 sm:py-10 lg:px-10; }
   .panel {
-    @apply rounded-xl border border-smoke/60 bg-obsidian;
+    @apply rounded-2xl border border-smoke/75 shadow-panel;
+    background: rgba(255, 255, 255, 0.78);
+    backdrop-filter: blur(16px);
   }
-  /* 主按钮：荧光绿底黑字，hover 提亮（配合 GSAP 有轻微上浮） */
   .btn-primary {
-    @apply inline-flex items-center justify-center gap-2 rounded-lg bg-lime px-4 py-2 text-sm font-semibold text-void transition-all duration-200 ease-out-expo hover:brightness-110 active:scale-[0.98] disabled:pointer-events-none disabled:opacity-40;
+    @apply inline-flex min-h-10 items-center justify-center gap-2 rounded-xl border border-lime/10 px-4 py-2 text-sm font-medium text-white transition-all duration-200 ease-out-expo active:scale-[0.98] disabled:pointer-events-none disabled:opacity-40;
+    background: linear-gradient(155deg, #3879f6, #2764e7);
+    box-shadow: 0 4px 10px -5px rgba(39, 100, 231, 0.45), inset 0 1px 0 rgba(255, 255, 255, 0.22);
   }
-  /* 次按钮：描边幽灵样式 */
+  .btn-primary:hover { transform: translateY(-1px); background: linear-gradient(155deg, #2d6eea, #2158cf); box-shadow: 0 6px 16px -6px rgba(39, 100, 231, 0.45); }
   .btn-ghost {
-    @apply inline-flex items-center justify-center gap-2 rounded-lg border border-smoke px-4 py-2 text-sm text-mist transition-all duration-200 ease-out-expo hover:border-fog hover:text-bone active:scale-[0.98] disabled:pointer-events-none disabled:opacity-40;
+    @apply inline-flex min-h-10 items-center justify-center gap-2 rounded-xl border border-smoke/90 bg-paper/75 px-4 py-2 text-sm font-medium text-mist transition-all duration-200 ease-out-expo hover:border-lime/25 hover:bg-paper hover:text-lime active:scale-[0.98] disabled:pointer-events-none disabled:opacity-40;
+    box-shadow: 0 2px 4px rgba(36, 67, 110, 0.025), inset 0 1px 0 white;
   }
-  /* 危险按钮：珊瑚红描边 */
-  .btn-danger {
-    @apply inline-flex items-center justify-center gap-2 rounded-lg border border-coral/40 px-4 py-2 text-sm text-coral transition-all duration-200 ease-out-expo hover:bg-coral/10 active:scale-[0.98] disabled:pointer-events-none disabled:opacity-40;
-  }
-  /* 输入框基类 */
+  .btn-danger { @apply inline-flex min-h-10 items-center justify-center gap-2 rounded-xl border border-coral/20 bg-paper/80 px-4 py-2 text-sm font-medium text-coral transition-all duration-200 ease-out-expo hover:border-coral/40 hover:bg-coral/5 active:scale-[0.98] disabled:pointer-events-none disabled:opacity-40; }
+  /**
+   * Inputs and native selects share one surface; the SVG arrow is used only
+   * by select.field so text inputs retain their normal content spacing.
+   */
   .field {
-    @apply w-full rounded-lg border border-smoke bg-graphite px-3 py-2 text-sm text-bone placeholder:text-ash outline-none transition-colors duration-200 focus:border-lime/60 disabled:opacity-50;
+    @apply w-full rounded-xl border border-smoke bg-paper/75 px-3.5 py-2.5 text-sm text-bone placeholder:text-ash outline-none transition-all duration-200 hover:border-lime/25 focus:border-lime/55 focus:bg-paper focus:ring-4 focus:ring-lime/5 disabled:bg-graphite disabled:opacity-60;
+    box-shadow: inset 0 1px 2px rgba(38, 70, 112, 0.025);
   }
-  /* 表单标签 */
-  .field-label {
-    @apply mb-1.5 block text-xs font-medium text-fog;
+  select.field {
+    padding-right: 2.25rem;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%2373839b' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m7 10 5 5 5-5'/%3E%3C/svg%3E");
+    background-position: right 0.75rem center;
+    background-repeat: no-repeat;
   }
-  /* 分节标题：小型大写风格 */
-  .section-title {
-    @apply text-xs font-semibold uppercase tracking-widest text-ash;
+  .field-label { @apply mb-2 block text-xs font-medium text-mist; }
+  .section-title { @apply font-mono text-[10px] font-medium uppercase tracking-[0.14em] text-ash; }
+  .code-block { @apply overflow-x-auto rounded-xl border border-smoke/80 bg-graphite/70 p-3.5 font-mono text-xs leading-relaxed text-mist; tab-size: 2; }
+  .page-header { @apply mb-8 flex flex-wrap items-start justify-between gap-5 sm:mb-9; }
+  .page-header h1 { @apply text-[28px] font-semibold tracking-[-0.035em] text-bone sm:text-[30px]; }
+  .page-header-accent { @apply mb-3 h-1 w-7 rounded-full bg-lime/70; }
+  .empty-state-icon {
+    @apply relative mb-2 flex h-16 w-16 items-center justify-center rounded-[20px] border border-lime/10 text-2xl text-lime/75;
+    background: linear-gradient(140deg, white, #e7f0ff);
+    box-shadow: 0 8px 24px -14px rgba(39, 100, 231, 0.32), inset 0 1px 0 white;
   }
-  /* 代码块 */
-  .code-block {
-    @apply overflow-x-auto rounded-lg border border-smoke/60 bg-void p-3 font-mono text-xs leading-relaxed text-mist;
-  }
+  .modal-panel { background: rgba(255, 255, 255, 0.94); backdrop-filter: blur(28px); }
 }
 
+/** Transient content affordances remain utilities rather than page-wide styles. */
 @layer utilities {
-  /* 主色文字辉光：用于 logo 与关键数字 */
-  .text-glow {
-    text-shadow: 0 0 18px rgba(228, 242, 34, 0.45);
-  }
-  /* 打字机光标 */
-  .caret::after {
-    content: '▍';
-    @apply ml-0.5 animate-blink-caret text-lime;
-  }
+  .caret::after { content: '▍'; @apply ml-0.5 animate-blink-caret text-lime; }
+}
+
+@media (max-width: 639px) {
+  .app-canvas { padding: 0; }
+  .app-shell { border: 0; border-radius: 0; }
+  .app-topbar { height: 60px; padding-inline: 16px; }
+  .app-sidebar { width: 60px; }
+  .page-container { padding: 24px 16px; }
+}
+
+/**
+ * Reduce CSS motion for the user preference; GSAP animations are controlled
+ * separately by their component effects.
+ */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; scroll-behavior: auto !important; }
 }

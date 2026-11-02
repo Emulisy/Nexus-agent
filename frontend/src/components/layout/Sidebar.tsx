@@ -1,78 +1,78 @@
 /**
- * 侧边栏导航 —— 固定左侧，导航项 hover 微亮 + 激活态荧光绿指示条。
+ * Workspace navigation driven by a single route metadata list.
+ * Admin links are hidden for ordinary users, and NavLink provides active-route
+ * state. Labels remain available through accessible names when the responsive
+ * layout hides their visible text.
  */
 import { NavLink } from 'react-router-dom';
 import { clsx } from 'clsx';
 import { useAuth } from '@/stores/auth';
+import { Brand } from '@/components/ui/Brand';
+import { Icon, type IconName } from '@/components/ui/Icon';
 
-/** 导航项配置：admin 专属项带 isAdmin 标记 */
+/**
+ * Navigation metadata shared by ordinary/admin sections. Hidden visible labels
+ * still have title/aria-label text in the compact layout.
+ */
 interface NavItem {
   to: string;
   label: string;
-  icon: string;
+  icon: IconName;
   isAdmin?: boolean;
 }
 
 const NAV: NavItem[] = [
-  { to: '/chat', label: '对话', icon: '◆' },
-  { to: '/agents', label: 'Agent', icon: '⬡' },
-  { to: '/memories', label: '记忆', icon: '❖' },
-  { to: '/kbs', label: '知识库', icon: '▤' },
-  { to: '/workflows', label: '工作流', icon: '⇶' },
-  { to: '/admin/models', label: '模型管理', icon: '⚙', isAdmin: true },
-  { to: '/admin/integrations', label: '集成中心', icon: '◉', isAdmin: true },
+  { to: '/chat', label: 'Chat', icon: 'chat' },
+  { to: '/agents', label: 'Agents', icon: 'agent' },
+  { to: '/memories', label: 'Memories', icon: 'memory' },
+  { to: '/kbs', label: 'Knowledge bases', icon: 'knowledge' },
+  { to: '/workflows', label: 'Workflows', icon: 'workflow' },
+  { to: '/admin/models', label: 'Models', icon: 'models', isAdmin: true },
+  { to: '/admin/integrations', label: 'Integrations', icon: 'integrations', isAdmin: true },
 ];
 
 export function Sidebar() {
   const user = useAuth((s) => s.user);
 
+  /**
+   * Let NavLink compute active state from the current URL rather than keeping
+   * a second selected-route state in the sidebar.
+   */
+  const renderItem = (n: NavItem) => (
+    <NavLink
+      key={n.to}
+      to={n.to}
+      title={n.label}
+      aria-label={n.label}
+      className={({ isActive }) => clsx(
+        'nav-link group',
+        isActive && 'nav-link-active',
+      )}
+    >
+      {({ isActive }) => <>
+        <Icon name={n.icon} className="h-[19px] w-[19px] shrink-0" />
+        <span className="hidden md:inline">{n.label}</span>
+        {isActive && <span aria-hidden="true" className="ml-auto hidden text-lime/65 md:block"><Icon name="arrow" className="h-3.5 w-3.5" /></span>}
+      </>}
+    </NavLink>
+  );
+
   return (
-    <aside className="flex h-full w-56 shrink-0 flex-col border-r border-smoke/60 bg-carbon">
-      {/* Logo */}
-      <div className="flex h-14 items-center gap-2.5 px-5">
-        <span className="text-lg text-glow text-lime">◆</span>
-        <span className="text-sm font-bold tracking-wider text-bone">
-          Nexus<span className="text-lime">Agent</span>
-        </span>
+    <aside className="app-sidebar">
+      <div className="flex h-[84px] shrink-0 items-center justify-center md:justify-start md:px-5">
+        <Brand compact />
       </div>
-
-      {/* 导航项 */}
-      <nav className="mt-2 flex-1 space-y-0.5 px-3">
-        {NAV.filter((n) => !n.isAdmin || user?.role === 'admin').map((n) => (
-          <NavLink
-            key={n.to}
-            to={n.to}
-            className={({ isActive }) =>
-              clsx(
-                'group relative flex items-center gap-3 rounded-lg px-3 py-2 text-sm transition-colors duration-200',
-                isActive
-                  ? 'bg-obsidian text-lime'
-                  : 'text-fog hover:bg-obsidian/60 hover:text-mist',
-              )
-            }
-          >
-            {/* 激活指示条 */}
-            {({ isActive }) => (
-              <>
-                <span
-                  className={clsx(
-                    'absolute left-0 h-4 w-0.5 rounded-full bg-lime transition-opacity',
-                    isActive ? 'opacity-100' : 'opacity-0',
-                  )}
-                />
-                <span className="text-xs opacity-80">{n.icon}</span>
-                <span>{n.label}</span>
-              </>
-            )}
-          </NavLink>
-        ))}
+      <nav aria-label="Main navigation" className="flex-1 overflow-y-auto px-2 pt-5 md:px-3">
+        <div className="section-title mb-4 hidden px-3 md:block">Workspace</div>
+        <div className="space-y-1.5">{NAV.filter((n) => !n.isAdmin).map(renderItem)}</div>
+        {user?.role === 'admin' && <div className="mt-7 border-t border-smoke/70 pt-5">
+          <div className="section-title mb-4 hidden px-3 md:block">Management</div>
+          <div className="space-y-1.5">{NAV.filter((n) => n.isAdmin).map(renderItem)}</div>
+        </div>}
       </nav>
-
-      {/* 版本脚注 */}
-      <div className="px-5 py-4 text-[10px] leading-relaxed text-ash">
-        NexusAgent v1.0
-        <br />
-        Go · Eino · React
+      <div className="mx-3 mb-5 mt-5 border-t border-smoke/70 pt-4 md:mx-5">
+        <div className="hidden items-center justify-between text-[11px] text-ash md:flex"><span className="font-medium tracking-tight">SupaAgent</span><span className="rounded border border-smoke/70 bg-white/60 px-1.5 py-0.5 font-mono text-[9px]">v1.0</span></div>
+        <span className="block text-center text-[9px] text-ash md:hidden">v1.0</span>
       </div>
     </aside>
   );

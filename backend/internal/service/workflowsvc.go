@@ -1,4 +1,7 @@
-// 工作流服务：CRUD / 执行 / HITL 审批。
+// Workflow services persist definitions and execute parsed DSL through the engine.
+// Owner-filtered queries scope definitions and run history to their creator.
+// Runs and step snapshots are stored around synchronous engine calls; human
+// approval reconstructs state from the original input and completed step outputs.
 package service
 
 import (
@@ -17,37 +20,39 @@ import (
 	"github.com/chengpeng-cp/nexus-agent/internal/workflow"
 )
 
-// WorkflowService 工作流业务。
+// WorkflowService shares repositories and receives an engine after the application dependencies are assembled.
 type WorkflowService struct {
 	svcs   *Services
 	engine *workflow.Engine
 }
 
-// NewWorkflowService 构造（引擎在 main 装配后注入）。
+// NewWorkflowService constructs definition management before an execution engine is attached.
 func NewWorkflowService(svcs *Services) *WorkflowService {
 	return &WorkflowService{svcs: svcs}
 }
 
-// SetEngine 注入解释器。
+// SetEngine attaches execution and resume support after model/tool/RAG callbacks are available.
 func (s *WorkflowService) SetEngine(e *workflow.Engine) { s.engine = e }
 
 // ---- CRUD ----
 
-// List 列表。
+// List returns only workflows created by the caller, with page and total count.
 func (s *WorkflowService) List(ctx context.Context, userID int64, q pagination.Query) ([]model.Workflow, int64, error) {
 	return s.svcs.Deps.Repos.Workflow.ListWorkflowsForCreator(ctx, userID, q.Offset(), q.Limit())
 }
 
-// Get 详情。
+// Get loads an owned definition and translates inaccessible or missing records to the workflow not-found error.
 func (s *WorkflowService) Get(ctx context.Context, userID, id int64) (*model.Workflow, error) {
 	w, err := s.svcs.Deps.Repos.Workflow.GetWorkflowForCreator(ctx, id, userID)
 	if err != nil {
-		return nil, errcode.ErrRunNotFound.WithMsg("工作流不存在").WithCause(err)
+		return nil, errcode.ErrRunNotFound.WithMsg("Workflow not found").WithCause(err)
 	}
 	return w, nil
 }
 
-// Create 创建（DSL 静态校验）。
+// Create validates the DSL before persisting the definition.
+// An empty name or description inherits parsed DSL metadata; creator assignment
+// is supplied by the caller, normally the authenticated HTTP handler.
 func (s *WorkflowService) Create(ctx context.Context, w *model.Workflow) error {
 	d, err := workflow.ParseDSL(w.DSL)
 	if err != nil {
@@ -62,8 +67,9 @@ func (s *WorkflowService) Create(ctx context.Context, w *model.Workflow) error {
 	return s.svcs.Deps.Repos.Workflow.CreateWorkflow(ctx, w)
 }
 
-// WorkflowUpdateInput keeps omitted boolean/status values distinguishable from
-// explicit false/zero values in PATCH-like update requests.
+// WorkflowUpdateInput distinguishes omitted fields from explicit false/zero values.
+// A supplied DSL is parsed before storage, and its name/description provide
+// defaults only when those fields were omitted from the update.
 type WorkflowUpdateInput struct {
 	Name        *string
 	Description *string
@@ -72,7 +78,7 @@ type WorkflowUpdateInput struct {
 	Status      *int16
 }
 
-// Update 更新。
+// Update merges supplied fields into an owned definition and saves them through an owner-filtered query.
 func (s *WorkflowService) Update(ctx context.Context, userID, id int64, in *WorkflowUpdateInput) error {
 	cur, err := s.Get(ctx, userID, id)
 	if err != nil {
@@ -106,11 +112,11 @@ func (s *WorkflowService) Update(ctx context.Context, userID, id int64, in *Work
 	return s.svcs.Deps.Repos.Workflow.UpdateWorkflowForCreator(ctx, cur, userID)
 }
 
-// Delete 删除。
+// Delete applies creator ownership in the delete query and maps an unmatched row to not-found.
 func (s *WorkflowService) Delete(ctx context.Context, userID, id int64) error {
 	err := s.svcs.Deps.Repos.Workflow.DeleteWorkflowForCreator(ctx, id, userID)
 	if errors.Is(err, gorm.ErrRecordNotFound) {
-		return errcode.ErrRunNotFound.WithMsg("工作流不存在")
+		return errcode.ErrRunNotFound.WithMsg("Workflow not found")
 	}
 	if err != nil {
 		return errcode.ErrInternal.WithCause(err)
@@ -118,24 +124,25 @@ func (s *WorkflowService) Delete(ctx context.Context, userID, id int64) error {
 	return nil
 }
 
-// Validate 仅校验 DSL（前端编辑器实时校验接口）。
+// Validate parses and statically checks DSL without saving a definition or starting execution.
 func (s *WorkflowService) Validate(dslText string) error {
 	_, err := workflow.ParseDSL(dslText)
 	return err
 }
 
-// ---- 执行 ----
-
-// RunInput 手动触发入参。
+// RunInput selects a saved workflow and provides its initial state for a manual run.
 type RunInput struct {
 	WorkflowID int64          `json:"workflow_id"`
 	Input      map[string]any `json:"input"`
 }
 
-// Run 同步执行工作流（教学版：HTTP 请求内完成；长任务可改为投递 worker）。
+// Run verifies ownership, attaches the user identity to execution context, and inserts a running record.
+// The engine executes synchronously. Returned steps are persisted best effort;
+// the final run status/output is then saved and returned. Engine errors trigger
+// a best-effort failed-run update before the error is returned to the caller.
 func (s *WorkflowService) Run(ctx context.Context, userID int64, in *RunInput) (*model.WorkflowRun, error) {
 	if s.engine == nil {
-		return nil, errcode.ErrNotImplement.WithMsg("workflow engine 未装配")
+		return nil, errcode.ErrNotImplement.WithMsg("Workflow engine is not configured")
 	}
 	ctx = security.WithUserID(ctx, userID)
 	w, err := s.Get(ctx, userID, in.WorkflowID)
@@ -166,7 +173,6 @@ func (s *WorkflowService) Run(ctx context.Context, userID int64, in *RunInput) (
 		return nil, errcode.From(err)
 	}
 
-	// 步骤快照落库
 	for key := range steps {
 		st := steps[key]
 		st.RunID = run.ID
@@ -188,10 +194,13 @@ func (s *WorkflowService) Run(ctx context.Context, userID int64, in *RunInput) (
 	return run, nil
 }
 
-// Approve HITL 审批：human 节点通过/驳回后恢复执行。
+// Approve accepts a decision only for an owned run waiting for human approval.
+// Rejection saves a canceled result. Approval rebuilds state from stored input
+// and succeeded steps, adds approved=true, and resumes the engine with the
+// current saved DSL. New step snapshots and the resulting run are then stored.
 func (s *WorkflowService) Approve(ctx context.Context, userID, runID int64, approved bool) (*model.WorkflowRun, error) {
 	if s.engine == nil {
-		return nil, errcode.ErrNotImplement.WithMsg("workflow engine 未装配")
+		return nil, errcode.ErrNotImplement.WithMsg("Workflow engine is not configured")
 	}
 	ctx = security.WithUserID(ctx, userID)
 	run, err := s.svcs.Deps.Repos.Workflow.GetRunForCreator(ctx, runID, userID)
@@ -199,7 +208,7 @@ func (s *WorkflowService) Approve(ctx context.Context, userID, runID int64, appr
 		return nil, errcode.ErrRunNotFound.WithCause(err)
 	}
 	if run.Status != model.RunStatusWaiting {
-		return nil, errcode.ErrInvalidParam.WithMsg("执行不在等待审批状态")
+		return nil, errcode.ErrInvalidParam.WithMsg("The run is not waiting for approval")
 	}
 	w, err := s.Get(ctx, userID, run.WorkflowID)
 	if err != nil {
@@ -210,7 +219,7 @@ func (s *WorkflowService) Approve(ctx context.Context, userID, runID int64, appr
 		return nil, err
 	}
 
-	// 驳回：不恢复执行，直接终止（audit 通过 state 记录）
+	// Record rejection in state and terminate without resuming the engine.
 	if !approved {
 		run.Status = model.RunStatusCanceled
 		if out, err := json.Marshal(map[string]any{"approved": false}); err == nil {
@@ -224,7 +233,7 @@ func (s *WorkflowService) Approve(ctx context.Context, userID, runID int64, appr
 		return run, nil
 	}
 
-	// 回放状态：input + 已完成步骤输出
+	// Rebuild state from the initial input and completed step outputs.
 	state := map[string]any{}
 	_ = json.Unmarshal(run.Input, &state)
 	for _, st := range run.Steps {
@@ -235,7 +244,7 @@ func (s *WorkflowService) Approve(ctx context.Context, userID, runID int64, appr
 			}
 		}
 	}
-	// 审批意见也进状态（后续节点可引用）
+	// Expose the approval decision to subsequent nodes.
 	state["approved"] = approved
 
 	res, steps, err := s.engine.Resume(ctx, dsl, state)
@@ -260,14 +269,15 @@ func (s *WorkflowService) Approve(ctx context.Context, userID, runID int64, appr
 	return run, nil
 }
 
-// ListRuns 执行历史。
+// ListRuns returns runs whose parent workflow belongs to the caller, optionally filtered by workflow ID.
 func (s *WorkflowService) ListRuns(ctx context.Context, userID, workflowID int64, q pagination.Query) ([]model.WorkflowRun, int64, error) {
 	return s.svcs.Deps.Repos.Workflow.ListRunsForCreator(ctx, userID, workflowID, q.Offset(), q.Limit())
 }
 
-// ---- 子工作流 runner（注入 workflow.Engine）----
-
-// SubflowRunner 实现 workflow 的递归执行（防 import 环：service 居中协调）。
+// SubflowRunner supplies the engine callback for nested workflow execution.
+// The caller identity must be present in context and own the nested definition.
+// This callback returns the nested output without creating a separate persisted
+// WorkflowRun record for that nested call.
 func (s *WorkflowService) SubflowRunner() workflow.SubRunner {
 	return func(ctx context.Context, workflowID int64, input map[string]any) (map[string]any, error) {
 		userID, ok := security.UserIDFromContext(ctx)
@@ -276,7 +286,7 @@ func (s *WorkflowService) SubflowRunner() workflow.SubRunner {
 		}
 		w, err := s.svcs.Deps.Repos.Workflow.GetWorkflowForCreator(ctx, workflowID, userID)
 		if err != nil {
-			return nil, errcode.ErrRunNotFound.WithMsg("子工作流 %d 不存在", workflowID).WithCause(err)
+			return nil, errcode.ErrRunNotFound.WithMsg("Subworkflow %d not found", workflowID).WithCause(err)
 		}
 		dsl, err := workflow.ParseDSL(w.DSL)
 		if err != nil {
@@ -287,13 +297,13 @@ func (s *WorkflowService) SubflowRunner() workflow.SubRunner {
 			return nil, err
 		}
 		if res.Status == model.RunStatusFailed {
-			return nil, errcode.ErrWorkflowDSL.WithMsg("子工作流失败: %s", res.Error)
+			return nil, errcode.ErrWorkflowDSL.WithMsg("Subworkflow failed: %s", res.Error)
 		}
 		return res.Output, nil
 	}
 }
 
-// GetWorkflowLookup 注入引擎的 KB 查询回调。
+// GetWorkflowLookup provides an ownership-filtered KB callback using the authenticated execution context.
 func (s *WorkflowService) GetWorkflowLookup() func(ctx context.Context, kbID int64) (*model.KnowledgeBase, error) {
 	return func(ctx context.Context, kbID int64) (*model.KnowledgeBase, error) {
 		userID, ok := security.UserIDFromContext(ctx)
@@ -304,7 +314,7 @@ func (s *WorkflowService) GetWorkflowLookup() func(ctx context.Context, kbID int
 	}
 }
 
-// GetWorkflowRun 查询执行详情。
+// GetWorkflowRun returns an owned run with preloaded step snapshots and normalizes storage errors.
 func (s *WorkflowService) GetWorkflowRun(ctx context.Context, userID, runID int64) (*model.WorkflowRun, error) {
 	run, err := s.svcs.Deps.Repos.Workflow.GetRunForCreator(ctx, runID, userID)
 	if err != nil {
@@ -316,13 +326,13 @@ func (s *WorkflowService) GetWorkflowRun(ctx context.Context, userID, runID int6
 	return run, nil
 }
 
-// ---- 工具函数 ----
-
+// mustJSON serializes JSON-compatible execution state and leaves marshaling errors unchecked by the caller.
 func mustJSON(v any) json.RawMessage {
 	b, _ := json.Marshal(v)
 	return b
 }
 
+// nowPtr allocates a current timestamp for nullable run lifecycle fields.
 func nowPtr() *time.Time {
 	t := time.Now()
 	return &t

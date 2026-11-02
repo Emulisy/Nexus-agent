@@ -1,7 +1,10 @@
 /**
- * 知识库列表页 —— 卡片网格展示全部知识库，支持新建与删除。
- * 数据流：listKBs 一次性拉取（page_size=100）；创建/删除成功后整表刷新。
+ * Knowledge base catalog with creation defaults and confirmed deletion.
+ * The list loads up to 100 records, and card navigation opens document/retrieval
+ * management. New-form state is reset on every open so canceled values do not
+ * leak into a later creation request.
  */
+import '@/styles/management.css';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
@@ -22,6 +25,7 @@ import { gsap, staggerEnter } from '@/lib/gsap';
 import { errMsg } from '@/lib/request';
 import { toast } from '@/stores/ui';
 import type { KnowledgeBase } from '@/types/kb';
+import { Icon } from '@/components/ui/Icon';
 
 export function KnowledgeBasesPage() {
   const navigate = useNavigate();
@@ -29,7 +33,7 @@ export function KnowledgeBasesPage() {
   const [kbs, setKbs] = useState<KnowledgeBase[]>([]);
   const [loading, setLoading] = useState(true);
 
-  /* ---- 新建弹窗表单 ---- */
+  /** Creation draft values remain local until the user submits. */
   const [createOpen, setCreateOpen] = useState(false);
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
@@ -37,13 +41,13 @@ export function KnowledgeBasesPage() {
   const [chunkOverlap, setChunkOverlap] = useState('64');
   const [creating, setCreating] = useState(false);
 
-  /* ---- 删除确认（持有待删除对象，弹窗内展示名称） ---- */
+  /** Deletion target and pending state belong to the confirmation flow. */
   const [delKB, setDelKB] = useState<KnowledgeBase | null>(null);
   const [deleting, setDeleting] = useState(false);
 
   const gridRef = useRef<HTMLDivElement>(null);
 
-  /** 拉取知识库列表（单页 100 条，控制台场景足够） */
+  /** Reload the first 100 knowledge bases used by the card catalog. */
   const load = useCallback(async () => {
     setLoading(true);
     try {
@@ -56,12 +60,14 @@ export function KnowledgeBasesPage() {
     }
   }, []);
 
-  // 首次挂载拉取列表
   useEffect(() => {
     void load();
   }, [load]);
 
-  // 列表卡片交错入场（动效克制：仅位移 10px + 淡入）
+  /**
+   * Wait for cards to mount before selecting children. Reverting the GSAP
+   * context cleans animation state when results change or the page unmounts.
+   */
   useEffect(() => {
     if (loading || kbs.length === 0) return;
     const grid = gridRef.current;
@@ -70,7 +76,10 @@ export function KnowledgeBasesPage() {
     return () => ctx.revert();
   }, [loading, kbs]);
 
-  /** 打开新建弹窗前重置表单为默认值 */
+  /**
+   * Reset all draft fields, including chunking defaults, whenever a fresh
+   * creation dialog opens.
+   */
   const openCreate = () => {
     setName('');
     setDescription('');
@@ -79,11 +88,14 @@ export function KnowledgeBasesPage() {
     setCreateOpen(true);
   };
 
-  /** 提交新建：name 必填，分块参数转数字（非法输入回退默认值） */
+  /**
+   * Require a nonempty name and convert chunking drafts to numeric values.
+   * Falsy numeric conversions use the existing defaults before submission.
+   */
   const submitCreate = async () => {
     const n = name.trim();
     if (!n) {
-      toast.err('请填写知识库名称');
+      toast.err('Please enter a knowledge base name');
       return;
     }
     setCreating(true);
@@ -94,7 +106,7 @@ export function KnowledgeBasesPage() {
         chunk_size: Number(chunkSize) || 512,
         chunk_overlap: Number(chunkOverlap) || 64,
       });
-      toast.ok('知识库创建成功');
+      toast.ok('Knowledge base created');
       setCreateOpen(false);
       await load();
     } catch (e) {
@@ -104,13 +116,16 @@ export function KnowledgeBasesPage() {
     }
   };
 
-  /** 确认删除知识库 */
+  /**
+   * Delete from the confirmation dialog, retain pending state for repeated
+   * click protection, and reload the catalog after the server accepts the action.
+   */
   const confirmDelete = async () => {
     if (!delKB) return;
     setDeleting(true);
     try {
       await deleteKB(delKB.id);
-      toast.ok('知识库已删除');
+      toast.ok('Knowledge base deleted');
       setDelKB(null);
       await load();
     } catch (e) {
@@ -121,45 +136,42 @@ export function KnowledgeBasesPage() {
   };
 
   return (
-    <div className="page-container">
+    <div className="page-container management-page">
       <PageHeader
-        title="知识库"
-        desc="上传文档构建 RAG 知识库，供智能体检索引用"
-        action={<Button onClick={openCreate}>＋ 新建知识库</Button>}
+        title="Knowledge bases"
+        desc="Upload documents to build knowledge bases that agents can search and cite."
+        action={<Button onClick={openCreate}>＋ New knowledge base</Button>}
       />
 
       {loading ? (
-        // 首屏加载
         <div className="flex justify-center py-20">
           <Spinner className="h-6 w-6 text-lime" />
         </div>
       ) : kbs.length === 0 ? (
-        // 空态：引导创建
         <EmptyState
-          icon="📚"
-          title="还没有知识库"
-          hint="创建一个知识库并上传文档，即可在对话中引用其中的知识"
-          action={<Button onClick={openCreate}>新建知识库</Button>}
+          icon={<Icon name="knowledge" className="h-6 w-6" />}
+          title="No knowledge bases yet"
+          hint="Create a knowledge base and upload documents to use them in conversations."
+          action={<Button onClick={openCreate}>New knowledge base</Button>}
         />
       ) : (
-        <div ref={gridRef} className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
+        <div ref={gridRef} className="grid grid-cols-1 gap-5 sm:grid-cols-2 lg:grid-cols-3">
           {kbs.map((kb) => (
             <Card
               key={kb.id}
-              className="group relative"
+              className="management-card group relative"
               onClick={() => navigate(`/kbs/${kb.id}`)}
             >
-              {/* 标题行：名称 + 状态徽标 + 悬浮删除按钮 */}
+              <div className="management-icon-well"><Icon name="knowledge" className="h-5 w-5" /></div>
               <div className="mb-2 flex items-start justify-between gap-2">
-                <h3 className="min-w-0 truncate text-sm font-semibold text-bone" title={kb.name}>
+                <h3 className="min-w-0 truncate text-base font-semibold text-bone" title={kb.name}>
                   {kb.name}
                 </h3>
                 <div className="flex shrink-0 items-center gap-1.5">
                   <StatusBadge status={kb.status} />
-                  {/* 悬浮才出现，避免视觉噪音；阻止冒泡避免触发卡片跳转 */}
                   <button
-                    className="hidden text-xs text-ash transition-colors hover:text-coral group-hover:block"
-                    title="删除知识库"
+                    className="management-kb-delete text-xs text-ash transition-all hover:bg-coral/5 hover:text-coral"
+                    title="Delete knowledge base"
                     onClick={(e) => {
                       e.stopPropagation();
                       setDelKB(kb);
@@ -170,14 +182,12 @@ export function KnowledgeBasesPage() {
                 </div>
               </div>
 
-              {/* 描述：最多两行 */}
               <p className="mb-3 line-clamp-2 min-h-[2rem] text-xs leading-4 text-fog">
-                {kb.description || '暂无描述'}
+                {kb.description || 'No description'}
               </p>
 
-              {/* 元信息：文档数 / 分块参数 / 更新时间 */}
-              <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-ash">
-                <span className="text-lime">{kb.doc_count} 篇文档</span>
+              <div className="flex flex-wrap items-center gap-x-3 gap-y-1 border-t border-smoke/60 pt-4 text-[11px] text-ash">
+                <span className="text-lime">{kb.doc_count} {kb.doc_count === 1 ? 'document' : 'documents'}</span>
                 <span>chunk_size {kb.chunk_size}</span>
                 <span>overlap {kb.chunk_overlap}</span>
                 <span className="ml-auto">{relativeTime(kb.updated_at)}</span>
@@ -187,18 +197,17 @@ export function KnowledgeBasesPage() {
         </div>
       )}
 
-      {/* 新建知识库弹窗 */}
       <Modal
         open={createOpen}
-        title="新建知识库"
+        title="New knowledge base"
         onClose={() => setCreateOpen(false)}
         footer={
           <>
             <Button variant="ghost" onClick={() => setCreateOpen(false)}>
-              取消
+              Cancel
             </Button>
             <Button loading={creating} onClick={() => void submitCreate()}>
-              创建
+              Create
             </Button>
           </>
         }
@@ -211,26 +220,26 @@ export function KnowledgeBasesPage() {
           }}
         >
           <div>
-            <label className="field-label">名称 *</label>
+            <label className="field-label">Name *</label>
             <Input
               value={name}
               onChange={(e) => setName(e.target.value)}
-              placeholder="如：产品文档库"
+              placeholder="Example: Product documentation"
               autoFocus
             />
           </div>
           <div>
-            <label className="field-label">描述</label>
+            <label className="field-label">Description</label>
             <Textarea
               rows={3}
               value={description}
               onChange={(e) => setDescription(e.target.value)}
-              placeholder="知识库用途说明（可选）"
+              placeholder="Describe the purpose of this knowledge base (optional)"
             />
           </div>
-          <div className="grid grid-cols-2 gap-3">
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
             <div>
-              <label className="field-label">分块大小（chunk_size）</label>
+              <label className="field-label">Chunk size</label>
               <Input
                 type="number"
                 min={64}
@@ -239,7 +248,7 @@ export function KnowledgeBasesPage() {
               />
             </div>
             <div>
-              <label className="field-label">分块重叠（chunk_overlap）</label>
+              <label className="field-label">Chunk overlap</label>
               <Input
                 type="number"
                 min={0}
@@ -251,13 +260,12 @@ export function KnowledgeBasesPage() {
         </form>
       </Modal>
 
-      {/* 删除知识库二次确认 */}
       <ConfirmDialog
         open={delKB !== null}
-        title="删除知识库"
-        content={delKB ? `确认删除「${delKB.name}」？其中全部文档与向量数据将被一并移除，不可恢复。` : ''}
+        title="Delete knowledge base"
+        content={delKB ? `Delete “${delKB.name}” and all its documents and vectors? This cannot be undone.` : ''}
         danger
-        confirmText="删除"
+        confirmText="Delete"
         loading={deleting}
         onCancel={() => setDelKB(null)}
         onConfirm={() => void confirmDelete()}

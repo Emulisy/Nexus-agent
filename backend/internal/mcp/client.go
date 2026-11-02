@@ -1,14 +1,7 @@
-// Package mcp MCP（Model Context Protocol）客户端（td.md §8.9，Ep 14）。
-//
-// MCP 是 Anthropic 提出的工具/资源接入开放协议，2025 年成为行业标准。
-// 本文件实现 Streamable HTTP 传输的客户端 —— 一切皆是 JSON-RPC 2.0：
-//
-//	initialize        → 握手，声明能力
-//	tools/list        → 发现服务端提供的工具（含 JSON Schema）
-//	tools/call        → 调用工具
-//
-// 教学要点：MCP 的价值在于"一次实现，处处可用"——
-// 我们不写任何具体工具逻辑，只做协议适配，工具生态直接接入。
+// Package mcp discovers and invokes tools over an HTTP JSON-RPC endpoint.
+// A client retains initialization and Mcp-Session-Id state across calls. Responses
+// may be JSON or an SSE data payload; this is a request/response adapter, not a
+// long-lived subscription or a process-based stdio transport.
 package mcp
 
 import (
@@ -23,7 +16,6 @@ import (
 	"github.com/chengpeng-cp/nexus-agent/internal/pkg/errcode"
 )
 
-// jsonRPCRequest JSON-RPC 2.0 请求。
 type jsonRPCRequest struct {
 	JSONRPC string `json:"jsonrpc"`
 	ID      int64  `json:"id"`
@@ -31,13 +23,11 @@ type jsonRPCRequest struct {
 	Params  any    `json:"params,omitempty"`
 }
 
-// jsonRPCError JSON-RPC 错误体。
 type jsonRPCError struct {
 	Code    int    `json:"code"`
 	Message string `json:"message"`
 }
 
-// jsonRPCResponse JSON-RPC 2.0 响应。
 type jsonRPCResponse struct {
 	JSONRPC string          `json:"jsonrpc"`
 	ID      int64           `json:"id"`
@@ -45,17 +35,20 @@ type jsonRPCResponse struct {
 	Error   *jsonRPCError   `json:"error,omitempty"`
 }
 
-// Client 单个 MCP Server 的客户端连接。
+// Client retains mutable handshake, request-ID, and session-header state.
+// Use one request at a time per instance; these fields are not synchronized for
+// concurrent calls. Configured headers are forwarded to the remote server.
 type Client struct {
 	baseURL     string
 	headers     map[string]string
 	httpClient  *http.Client
 	nextID      int64
-	sessionID   string // Streamable HTTP 会话（Mcp-Session-Id 头）
+	sessionID   string
 	initialized bool
 }
 
-// NewClient 构造。
+// NewClient configures the endpoint, optional headers, and a 60-second HTTP timeout.
+// Initialization is deferred until discovery or invocation is requested.
 func NewClient(baseURL string, headers map[string]string) *Client {
 	return &Client{
 		baseURL:    baseURL,
@@ -64,14 +57,17 @@ func NewClient(baseURL string, headers map[string]string) *Client {
 	}
 }
 
-// ToolDef MCP 工具定义（协议字段与 OpenAI Function Schema 高度同构）。
+// ToolDef preserves the remote name, description, and input schema used to create
+// model-visible tool definitions in the application catalog.
 type ToolDef struct {
 	Name        string         `json:"name"`
 	Description string         `json:"description,omitempty"`
 	InputSchema map[string]any `json:"inputSchema"`
 }
 
-// Initialize 协议握手（惰性：首次调用前自动执行）。
+// Initialize sends the protocol handshake once for this client instance.
+// The initialized flag is set only after a successful response; subsequent operations
+// reuse the handshake and any session header returned by the server.
 func (c *Client) Initialize(ctx context.Context) error {
 	if c.initialized {
 		return nil
@@ -94,7 +90,8 @@ func (c *Client) Initialize(ctx context.Context) error {
 	return nil
 }
 
-// ListTools 工具发现。
+// ListTools initializes as needed and returns the tools/list result.
+// Transport and protocol failures are wrapped as MCP connection errors.
 func (c *Client) ListTools(ctx context.Context) ([]ToolDef, error) {
 	if err := c.Initialize(ctx); err != nil {
 		return nil, err
@@ -108,7 +105,9 @@ func (c *Client) ListTools(ctx context.Context) ([]ToolDef, error) {
 	return result.Tools, nil
 }
 
-// CallTool 调用工具。返回结构化内容文本。
+// CallTool invokes one named tool after initialization. It concatenates text
+// content parts in order, ignores non-text content, and turns remote isError
+// results into an application tool-call failure.
 func (c *Client) CallTool(ctx context.Context, name string, args map[string]any) (string, error) {
 	if err := c.Initialize(ctx); err != nil {
 		return "", err
@@ -135,7 +134,9 @@ func (c *Client) CallTool(ctx context.Context, name string, args map[string]any)
 	return out, nil
 }
 
-// call 发送一次 JSON-RPC 请求（Streamable HTTP：单次 POST）。
+// call sends one numbered JSON-RPC request with configured headers and the current
+// session ID. It retains a returned session header, reads at most 4 MiB, checks
+// HTTP/RPC errors, and optionally decodes the result into the supplied target.
 func (c *Client) call(ctx context.Context, method string, params any, out any) (json.RawMessage, error) {
 	c.nextID++
 	reqBody, err := json.Marshal(jsonRPCRequest{
@@ -164,7 +165,6 @@ func (c *Client) call(ctx context.Context, method string, params any, out any) (
 	}
 	defer resp.Body.Close()
 
-	// 会话 ID 由服务端在 initialize 响应头下发
 	if sid := resp.Header.Get("Mcp-Session-Id"); sid != "" {
 		c.sessionID = sid
 	}
@@ -177,7 +177,6 @@ func (c *Client) call(ctx context.Context, method string, params any, out any) (
 		return nil, fmt.Errorf("http %d: %s", resp.StatusCode, truncate(string(body), 256))
 	}
 
-	// 响应可能是 JSON 或 SSE 帧（服务端可选流式回包），兼容处理
 	payload := extractJSONPayload(body)
 	var rpcResp jsonRPCResponse
 	if err := json.Unmarshal(payload, &rpcResp); err != nil {
@@ -194,10 +193,11 @@ func (c *Client) call(ctx context.Context, method string, params any, out any) (
 	return rpcResp.Result, nil
 }
 
-// extractJSONPayload 从响应体提取 JSON（兼容纯 JSON 与 SSE `data:` 帧）。
+// extractJSONPayload accepts a raw JSON body or the first SSE data line.
+// It does not aggregate multiple frames or implement multiline SSE data fields.
 func extractJSONPayload(body []byte) []byte {
 	s := string(body)
-	// SSE 形态：event: message\ndata: {...}
+
 	for _, line := range splitLines(s) {
 		if after, ok := cutPrefix(line, "data:"); ok {
 			return []byte(after)
@@ -206,6 +206,8 @@ func extractJSONPayload(body []byte) []byte {
 	return body
 }
 
+// splitLines separates LF-delimited frames and removes a trailing CR per line
+// so the payload extractor accepts both LF and CRLF responses.
 func splitLines(s string) []string {
 	var out []string
 	start := 0
@@ -242,6 +244,7 @@ func trimSpace(s string) string {
 	return s
 }
 
+// truncate bounds diagnostic response text by bytes and adds an ellipsis when cut.
 func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
@@ -249,7 +252,8 @@ func truncate(s string, n int) string {
 	return s[:n] + "..."
 }
 
-// Ping 健康检查（tools/list 可达即视为健康）。
+// Ping treats a successful initialized tools/list request as a health check.
+// It exercises discovery rather than a dedicated transport ping method.
 func (c *Client) Ping(ctx context.Context) error {
 	_, err := c.ListTools(ctx)
 	return err

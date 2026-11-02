@@ -1,17 +1,6 @@
-// 工作流解释器：沿边驱动节点执行，状态贯穿全流程（td.md §8.8）。
-//
-// 核心循环：
-//
-//	state = input vars
-//	cur = start node
-//	for cur != "" {
-//	    result = executeNode(cur, state)      // 各类型节点各自的执行器
-//	    state[cur] = result                   // 后续节点用 {{cur}} 引用
-//	    cur = Next(cur, condResult?)          // condition 节点决定走向
-//	}
-//
-// HITL（human 节点）：执行到审批节点时持久化状态并返回 waiting，
-// 审批通过后 Resume 从该节点继续 —— 断点恢复的关键是"步骤快照可回放"。
+// The workflow interpreter carries one state map through node execution. Completed
+// node outputs are stored under node keys; approval nodes return a waiting result
+// so services can persist state and decide when to resume.
 package workflow
 
 import (
@@ -29,43 +18,48 @@ import (
 	"github.com/chengpeng-cp/nexus-agent/internal/tool"
 )
 
-// SubRunner 子工作流递归执行函数类型。
+// SubRunner executes a referenced workflow through service wiring, keeping the
+// interpreter independent of workflow repositories and run lifecycle handling.
 type SubRunner func(ctx context.Context, workflowID int64, input map[string]any) (map[string]any, error)
 
-// Deps 引擎外部依赖（全部面向既有组件注入，工作流不重复造轮子）。
+// Deps provides model calls, tools, retrieval, and service-owned lookup functions.
+// Resolvers keep credentials and user access decisions outside the interpreter.
 type Deps struct {
 	Gateway *llm.Gateway
-	Tools   tool.Executor  // 复用 Agent 工具执行器
-	RAG     *engine.Engine // kb 节点检索
+	Tools   tool.Executor
+	RAG     *engine.Engine
 
-	// ResolveModel 按别名解析模型描述符（service 层注入，网关不查库原则）。
-	// 返回 (主模型, 备用模型, 错误)；alias 为空时返回平台默认 chat 模型。
+	// ResolveModel returns primary/fallback descriptors for an alias, using the
+	// platform default for an empty alias.
 	ResolveModel func(ctx context.Context, alias string) (*llm.ModelDescriptor, *llm.ModelDescriptor, error)
 
-	// GetKB 知识库查询（kb 节点用）。
+	// GetKB supplies the knowledge-base record used by a kb node.
 	GetKB func(ctx context.Context, kbID int64) (*model.KnowledgeBase, error)
 
-	// SubRunner 子工作流递归执行（service 注入防循环依赖）。
 	SubRunner SubRunner
 }
 
-// Engine 工作流引擎。
+// Engine interprets validated DSL nodes using injected application dependencies.
 type Engine struct {
 	deps Deps
 }
 
-// New 构造。
+// New binds execution dependencies; ParseDSL/Validate should run before Run.
 func New(deps Deps) *Engine { return &Engine{deps: deps} }
 
-// ExecResult 一次执行的结果。
+// ExecResult contains the run status and current state snapshot. Node execution
+// failures are represented by failed status plus Error; malformed graph lookups
+// can instead be returned as the Go error alongside any collected step records.
 type ExecResult struct {
-	Status  string         // succeeded / waiting_approval / failed
-	Output  map[string]any // 最终输出（state 快照）
-	WaitKey string         // waiting_approval 时的节点 key
-	Error   string         // failed 时的错误
+	Status string
+	Output map[string]any
+	// WaitKey identifies the approval node when Status is waiting_approval.
+	WaitKey string
+	Error   string
 }
 
-// Run 执行工作流。
+// Run copies input entries into a new state map and begins at the DSL entry node.
+// It returns per-node outcome records for persistence by the calling service.
 func (e *Engine) Run(ctx context.Context, d *DSL, input map[string]any) (*ExecResult, map[string]model.WorkflowStepRun, error) {
 	state := map[string]any{}
 	for k, v := range input {
@@ -74,7 +68,10 @@ func (e *Engine) Run(ctx context.Context, d *DSL, input map[string]any) (*ExecRe
 	return e.drive(ctx, d, d.StartKey(), state)
 }
 
-// Resume HITL 审批后的恢复执行：从审批节点沿边继续。
+// Resume continues after the first human node in declaration order using the
+// provided saved state. It follows that node approval branch rather than executing
+// the human node again, which would immediately pause the run. It does not select
+// a persisted WaitKey independently of the definition.
 func (e *Engine) Resume(ctx context.Context, d *DSL, state map[string]any) (*ExecResult, map[string]model.WorkflowStepRun, error) {
 	var waitKey string
 	for i := range d.Nodes {
@@ -86,16 +83,19 @@ func (e *Engine) Resume(ctx context.Context, d *DSL, state map[string]any) (*Exe
 	if waitKey == "" {
 		return nil, nil, errcode.ErrWorkflowDSL.WithMsg("no human node to resume")
 	}
-	// 关键：human 节点的 executeNode 恒返回 wait=true，
-	// 若从 waitKey 本身开始 drive 会立刻再次暂停——必须沿"同意"分支从下一节点继续。
+
+	// Starting at the approval node would immediately pause again.
 	return e.drive(ctx, d, d.Next(waitKey, true), state)
 }
 
-// drive 执行主循环（Run 与 Resume 共用）。
+// drive runs nodes until the graph ends, a node fails, an approval is encountered,
+// or the traversal bound is reached. Outputs become state[nodeKey] only after a
+// non-waiting successful step. The bounded loop limits unexpected traversal even
+// if a definition bypassed normal validation.
 func (e *Engine) drive(ctx context.Context, d *DSL, start string, state map[string]any) (*ExecResult, map[string]model.WorkflowStepRun, error) {
 	steps := map[string]model.WorkflowStepRun{}
 	cur := start
-	// 迭代上限防呆：节点数的 2 倍（条件分支最多走两遍）
+
 	for i := 0; i < len(d.Nodes)*2+8 && cur != ""; i++ {
 		n := e.node(d, cur)
 		if n == nil {
@@ -107,7 +107,9 @@ func (e *Engine) drive(ctx context.Context, d *DSL, start string, state map[stri
 		if err != nil {
 			return &ExecResult{Status: model.RunStatusFailed, Error: err.Error(), Output: state}, steps, nil
 		}
-		if wait { // HITL 暂停：state 由调用方持久化，等待审批恢复
+		// The service persists the returned state and step snapshot before requesting
+		// approval. The interpreter does not block a goroutine waiting for a user.
+		if wait {
 			return &ExecResult{Status: model.RunStatusWaiting, WaitKey: cur, Output: state}, steps, nil
 		}
 		state[cur] = res
@@ -116,7 +118,7 @@ func (e *Engine) drive(ctx context.Context, d *DSL, start string, state map[stri
 	return &ExecResult{Status: model.RunStatusSucceeded, Output: state}, steps, nil
 }
 
-// node 取节点定义。
+// node returns the definition entry for a key without copying the entire node.
 func (e *Engine) node(d *DSL, key string) *Node {
 	for i := range d.Nodes {
 		if d.Nodes[i].Key == key {
@@ -126,8 +128,9 @@ func (e *Engine) node(d *DSL, key string) *Node {
 	return nil
 }
 
-// executeNode 节点执行分发。
-// 返回：结果值 / 条件节点布尔 / 是否 HITL 等待 / 错误。
+// executeNode returns a result, condition routing value, approval-wait flag, and
+// error. Node-specific executors share this tuple so graph traversal stays separate
+// from each operation implementation.
 func (e *Engine) executeNode(ctx context.Context, d *DSL, n *Node, state map[string]any) (val any, cond bool, wait bool, err error) {
 	switch n.Type {
 	case "llm":
@@ -144,8 +147,9 @@ func (e *Engine) executeNode(ctx context.Context, d *DSL, n *Node, state map[str
 		return nil, ok, false, nil
 	case "parallel":
 		return e.runParallel(ctx, d, n, state)
+	// Return the rendered approval prompt as step output; drive exposes a waiting
+	// result for service-side persistence and approval handling.
 	case "human":
-		// 审批请求内容渲染后交由上层持久化；此处仅标记等待
 		return RenderTemplate(n.Prompt, state), false, true, nil
 	case "subflow":
 		return e.runSubflow(ctx, n, state)
@@ -154,7 +158,9 @@ func (e *Engine) executeNode(ctx context.Context, d *DSL, n *Node, state map[str
 	}
 }
 
-// runLLM LLM 节点：模板渲染 → 网关调用（非流式，工作流内不需要打字机效果）。
+// runLLM resolves a model alias, renders state into the prompt, and performs one
+// non-streaming model call. A positive TimeoutS adds a node-local deadline; results
+// are stored only after the complete response is available.
 func (e *Engine) runLLM(ctx context.Context, n *Node, state map[string]any) (any, bool, bool, error) {
 	if e.deps.ResolveModel == nil {
 		return nil, false, false, errcode.ErrNotImplement.WithMsg("model resolver not configured")
@@ -179,7 +185,9 @@ func (e *Engine) runLLM(ctx context.Context, n *Node, state map[string]any) (any
 	return resp.Content, false, false, nil
 }
 
-// runTool 工具节点：参数模板渲染 → 复用 Agent 工具执行器。
+// runTool renders string argument values and reuses the shared tool executor.
+// It passes an empty agent binding list because workflow nodes identify a tool
+// directly; a non-ok tool status becomes a failed workflow node.
 func (e *Engine) runTool(ctx context.Context, n *Node, state map[string]any) (any, bool, bool, error) {
 	args := map[string]any{}
 	for k, v := range n.Args {
@@ -197,7 +205,8 @@ func (e *Engine) runTool(ctx context.Context, n *Node, state map[string]any) (an
 	return res.Output, false, false, nil
 }
 
-// runKB 知识库节点：RAG 混合检索，返回引用文本（供 llm 节点 {{nodeKey}} 引用）。
+// runKB retrieves the referenced knowledge base through GetKB, runs the shared
+// hybrid retrieval engine, and returns its formatted context as this node output.
 func (e *Engine) runKB(ctx context.Context, n *Node, state map[string]any) (any, bool, bool, error) {
 	if e.deps.RAG == nil || e.deps.GetKB == nil {
 		return nil, false, false, errcode.ErrNotImplement.WithMsg("rag engine not configured")
@@ -214,10 +223,10 @@ func (e *Engine) runKB(ctx context.Context, n *Node, state map[string]any) (any,
 	return engine.BuildContext(refs), false, false, nil
 }
 
-// runParallel 并行节点：branches 中各节点并发执行，结果合并为 {nodeKey: result}。
-//
-// 教学点：并行分支各自独立执行互不感知；state 为只读快照（写回在 join 点统一合并），
-// 避免并发写 map 的数据竞争 —— 这是"共享状态并发"最朴素也最安全的约束。
+// runParallel executes the named branch nodes once each in concurrent goroutines.
+// All branches read the shared state without updating it; the parent joins their
+// results into a map keyed by branch node. It does not independently traverse the
+// outgoing edges of each branch node.
 func (e *Engine) runParallel(ctx context.Context, d *DSL, n *Node, state map[string]any) (any, bool, bool, error) {
 	type job struct {
 		key string
@@ -238,6 +247,8 @@ func (e *Engine) runParallel(ctx context.Context, d *DSL, n *Node, state map[str
 		val any
 		err error
 	}
+	// One buffered result per job lets every branch finish even before the join
+	// loop starts receiving. Only the join goroutine writes the output map.
 	ch := make(chan result, len(jobs))
 	for _, j := range jobs {
 		go func(j job) {
@@ -261,7 +272,8 @@ func (e *Engine) runParallel(ctx context.Context, d *DSL, n *Node, state map[str
 	return out, false, false, nil
 }
 
-// runSubflow 子工作流：递归执行另一个工作流（service 注入 runner 防循环依赖）。
+// runSubflow delegates the current state to the injected nested-workflow runner
+// and exposes its returned output as one node result.
 func (e *Engine) runSubflow(ctx context.Context, n *Node, state map[string]any) (any, bool, bool, error) {
 	if e.deps.SubRunner == nil {
 		return nil, false, false, errcode.ErrNotImplement.WithMsg("subflow runner not configured")
@@ -273,10 +285,11 @@ func (e *Engine) runSubflow(ctx context.Context, n *Node, state map[string]any) 
 	return out, false, false, nil
 }
 
-// evalExpr 对 state 求值 expr 布尔表达式（condition 节点）。
+// evalExpr evaluates a boolean expression against current state with built-ins
+// disabled. An empty expression is true, allowing an unconditional condition path.
 func evalExpr(expression string, state map[string]any) (bool, error) {
 	if expression == "" {
-		return true, nil // 空表达式恒真（直通）
+		return true, nil
 	}
 	program, err := expr.Compile(expression, expr.Env(state), expr.AsBool(), expr.DisableAllBuiltins())
 	if err != nil {
@@ -290,7 +303,9 @@ func evalExpr(expression string, state map[string]any) (bool, error) {
 	return ok, nil
 }
 
-// snapshot 生成步骤快照（断点恢复 + 时间线展示）。
+// snapshot creates a persistence record for the observed node outcome. Conditions
+// have no result payload; other successful outputs are encoded as JSON. The service
+// owns storing these records alongside the workflow run.
 func (e *Engine) snapshot(n *Node, val any, err error) model.WorkflowStepRun {
 	now := time.Now()
 	s := model.WorkflowStepRun{
@@ -303,7 +318,7 @@ func (e *Engine) snapshot(n *Node, val any, err error) model.WorkflowStepRun {
 		s.Error = err.Error()
 	} else {
 		s.Status = model.RunStatusSucceeded
-		if n.Type != "condition" { // condition 无输出
+		if n.Type != "condition" {
 			b, _ := json.Marshal(val)
 			s.Output = b
 		}

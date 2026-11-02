@@ -1,9 +1,7 @@
-// Package rag RAG 引擎：Loader 文档加载（td.md §8.5，Ep 06）。
-//
-// 支持格式与实现取舍（教学点：依赖最小化）：
-//   - txt/md/html：纯 Go 读文件 + HTML 去标签；
-//   - pdf：github.com/dslipak/pdf 提取文本与页码（轻量但能力有限，演进见 td §13）；
-//   - docx：docx 本质是 zip，标准库读 word/document.xml 去标签 —— 不引重型依赖。
+// Package loader converts supported uploaded document bytes to page-oriented text.
+// PDF keeps source page numbers, DOCX reads document.xml, and plain formats use
+// synthetic pages for citation offsets. HTML currently follows the plain-text path;
+// this loader does not perform OCR or a browser-based extraction pass.
 package loader
 
 import (
@@ -18,18 +16,20 @@ import (
 	pdf "github.com/dslipak/pdf"
 )
 
-// LoadedDoc 解析结果：分页内容（page 从 1 开始）。
+// LoadedDoc contains pages in source order for the splitter and indexer.
 type LoadedDoc struct {
 	Pages []PageContent
 }
 
-// PageContent 单页/单段内容。
+// PageContent associates extracted text with a one-based source or synthetic page.
+// The indexer stores this number in chunk metadata for later citations.
 type PageContent struct {
-	Page    int    // 页码（md/txt 无页码概念，按 1024 字节粗分段递增）
-	Content string // 纯文本
+	Page    int
+	Content string
 }
 
-// Load 按文件类型分发解析。
+// Load selects a parser from the filename extension. Unknown extensions fail
+// explicitly; a missing extension is treated as plain text.
 func Load(filename string, data []byte) (*LoadedDoc, error) {
 	switch strings.ToLower(filepath.Ext(filename)) {
 	case ".pdf":
@@ -38,14 +38,16 @@ func Load(filename string, data []byte) (*LoadedDoc, error) {
 		return loadDocx(data)
 	case ".html", ".htm":
 		return loadPlainText(data), nil
-	case ".md", ".markdown", ".txt", "": // 无后缀按文本处理
+	case ".md", ".markdown", ".txt", "":
 		return loadPlainText(data), nil
 	default:
 		return nil, fmt.Errorf("unsupported file type: %s", filepath.Ext(filename))
 	}
 }
 
-// loadPlainText 纯文本：按 1024 字节粗分段模拟页码（保序，方便引用定位）。
+// loadPlainText normalizes line endings and assigns synthetic pages in blocks of
+// 1,024 runes. Rune boundaries preserve Unicode characters; empty input still
+// produces one page so callers receive a consistent document structure.
 func loadPlainText(data []byte) *LoadedDoc {
 	text := normalizeText(string(data))
 	var pages []PageContent
@@ -66,7 +68,9 @@ func loadPlainText(data []byte) *LoadedDoc {
 	return &LoadedDoc{Pages: pages}
 }
 
-// loadPDF 逐页提取文本。
+// loadPDF extracts readable text page by page. Unreadable or blank pages are
+// skipped; a document with no extractable text fails instead of yielding an
+// apparently successful empty index.
 func loadPDF(data []byte) (*LoadedDoc, error) {
 	reader := bytes.NewReader(data)
 	doc, err := pdf.NewReader(reader, int64(len(data)))
@@ -76,10 +80,10 @@ func loadPDF(data []byte) (*LoadedDoc, error) {
 
 	var pages []PageContent
 	for i := 0; i < doc.NumPage(); i++ {
-		p := doc.Page(i + 1) // 页码从 1 开始
+		p := doc.Page(i + 1)
 		text, err := p.GetPlainText(nil)
 		if err != nil {
-			continue // 单页失败跳过，不阻塞整体
+			continue
 		}
 		content := normalizeText(string(text))
 		if strings.TrimSpace(content) == "" {
@@ -93,7 +97,8 @@ func loadPDF(data []byte) (*LoadedDoc, error) {
 	return &LoadedDoc{Pages: pages}, nil
 }
 
-// loadDocx 解压读 word/document.xml 去标签。
+// loadDocx opens the DOCX ZIP container, reads word/document.xml, removes XML tags,
+// and reuses plain-text pagination. Other archive entries are not indexed.
 func loadDocx(data []byte) (*LoadedDoc, error) {
 	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
 	if err != nil {
@@ -119,16 +124,17 @@ func loadDocx(data []byte) (*LoadedDoc, error) {
 
 var xmlTagRe = regexp.MustCompile(`<[^>]+>`)
 
-// stripXML 去 XML 标签（w:t 之间的文本自然保留）。
+// stripXML replaces markup with spaces, retaining the text between tags.
 func stripXML(s string) string {
 	return xmlTagRe.ReplaceAllString(s, " ")
 }
 
-// normalizeText 文本规范化：统一换行、去多余空白。
+// normalizeText converts CRLF/CR to LF and collapses runs of more than two newlines
+// without otherwise rewriting document text.
 func normalizeText(s string) string {
 	s = strings.ReplaceAll(s, "\r\n", "\n")
 	s = strings.ReplaceAll(s, "\r", "\n")
-	// 压缩连续空行
+
 	for strings.Contains(s, "\n\n\n") {
 		s = strings.ReplaceAll(s, "\n\n\n", "\n\n")
 	}

@@ -1,3 +1,7 @@
+/**
+ * Fallback for unmatched authenticated routes. The return action takes the
+ * user back to chat without depending on an unknown resource identifier.
+ */
 import { useNavigate } from 'react-router-dom';
 import { EmptyState, Button } from '@/components/ui/primitives';
 
@@ -7,9 +11,9 @@ export function NotFoundPage() {
     <div className="page-container">
       <EmptyState
         icon="⌀"
-        title="页面不存在"
-        hint="你可能访问了一个被删除或从未存在的路由"
-        action={<Button onClick={() => navigate('/chat')}>回到对话</Button>}
+        title="Page not found"
+        hint="This page may have been removed, or the address may be incorrect."
+        action={<Button onClick={() => navigate('/chat')}>Back to chat</Button>}
       />
     </div>
   );

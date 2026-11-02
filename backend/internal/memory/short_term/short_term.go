@@ -1,7 +1,6 @@
-// Package memory 记忆系统（td.md §8.4）。
-//
-// 短期记忆三策略：滑动窗口 → 裁剪最旧工具消息 → 摘要压缩。
-// 本文件：窗口管理与 Token 预算。
+// Package memory builds a bounded recent conversation for model input. Short-term
+// state is derived from supplied messages for each request; it is not a separate
+// Redis cache and does not summarize history with another model call.
 package memory
 
 import (
@@ -10,24 +9,27 @@ import (
 	"github.com/chengpeng-cp/nexus-agent/internal/llm"
 )
 
-// ShortTermConfig 短期记忆配置。
+// ShortTermConfig selects a message window and an approximate token allowance.
+// The allowance is used to shorten tool observations, not as an exact tokenizer
+// or a hard cap on every kind of message.
 type ShortTermConfig struct {
-	Window      int    // 保留最近 N 条消息
-	TokenBudget int    // 上下文 Token 预算
+	// Window retains the most recent N messages before any tool-result compression.
+	Window int
+	// TokenBudget is an estimate based on message text plus fixed metadata overhead.
+	TokenBudget int
 }
 
-// DefaultShortTermConfig 默认配置。
+// DefaultShortTermConfig retains twenty messages with an 8,192-token estimate.
 func DefaultShortTermConfig() ShortTermConfig {
 	return ShortTermConfig{Window: 20, TokenBudget: 8192}
 }
 
-// ShortTerm 短期记忆管理器。
+// ShortTerm applies the configured window and compression policy to one message list.
 type ShortTerm struct {
-	cfg     ShortTermConfig
-	summary string // 摘要压缩后的历史（作为 system 前缀）
+	cfg ShortTermConfig
 }
 
-// NewShortTerm 构造。
+// NewShortTerm uses the default configuration when Window is non-positive.
 func NewShortTerm(cfg ShortTermConfig) *ShortTerm {
 	if cfg.Window <= 0 {
 		cfg = DefaultShortTermConfig()
@@ -35,33 +37,25 @@ func NewShortTerm(cfg ShortTermConfig) *ShortTerm {
 	return &ShortTerm{cfg: cfg}
 }
 
-// Apply 生成"注入模型的最终消息序列"：
-//
-//	[system] + [摘要前缀(若有)] + [最近窗口内的消息]
-//
-// 超预算时的裁剪顺序（教学点：先裁工具结果，它们通常最长且可再生成）：
-//	① 丢窗口外消息 ② 压缩最旧的工具 Observation ③ 触发摘要（上层调用 Summarize）
+// Apply copies the retained recent window, estimates its size, and shortens older
+// tool observations while over budget. Non-tool messages are left intact; callers
+// prepend their current system prompt after this history-only pass.
 func (s *ShortTerm) Apply(msgs []llm.Message) []llm.Message {
-	// ① 滑动窗口
 	if len(msgs) > s.cfg.Window {
 		msgs = msgs[len(msgs)-s.cfg.Window:]
 	}
 
-	out := make([]llm.Message, 0, len(msgs)+1)
-	// ② 摘要前缀
-	if s.summary != "" {
-		out = append(out, llm.Message{
-			Role:    llm.RoleSystem,
-			Content: "【历史对话摘要】" + s.summary,
-		})
-	}
+	// Copy the slice before replacing message content so the supplied history is
+	// not modified by tool-result compression.
+	out := make([]llm.Message, 0, len(msgs))
 	out = append(out, msgs...)
 
-	// ③ Token 预算：从最旧的工具消息开始压缩
 	budget := s.cfg.TokenBudget
 	for i := range out {
 		budget -= estimateMsgTokens(out[i])
 	}
+	// Prefer shortening tool results because they can dominate context length and
+	// are less useful than recent user intent once the next model step has used them.
 	for budget < 0 {
 		idx := s.findOldestToolMsg(out)
 		if idx < 0 {
@@ -73,13 +67,8 @@ func (s *ShortTerm) Apply(msgs []llm.Message) []llm.Message {
 	return out
 }
 
-// SetSummary 设置摘要（由摘要器产出后回填）。
-func (s *ShortTerm) SetSummary(summary string) { s.summary = summary }
-
-// Summary 当前摘要。
-func (s *ShortTerm) Summary() string { return s.summary }
-
-// findOldestToolMsg 找最旧的未压缩工具消息。
+// findOldestToolMsg chooses the earliest tool observation without a compression
+// marker. It leaves user, assistant, and system messages unchanged.
 func (s *ShortTerm) findOldestToolMsg(msgs []llm.Message) int {
 	for i, m := range msgs {
 		if m.Role == llm.RoleTool && !strings.HasSuffix(m.Content, "…[compressed]") {
@@ -89,15 +78,17 @@ func (s *ShortTerm) findOldestToolMsg(msgs []llm.Message) int {
 	return -1
 }
 
-// estimateMsgTokens 估算单条消息 Token（复用 llm 包启发式）。
+// estimateMsgTokens uses half the rune count plus eight tokens of metadata
+// overhead. It intentionally does not depend on a specific model tokenizer.
 func estimateMsgTokens(m llm.Message) int {
-	n := 8 // 元数据开销
+	n := 8
 	n += len([]rune(m.Content)) / 2
 	n += len([]rune(m.ReasoningContent)) / 2
 	return n
 }
 
-// truncateForBudget 截断并打压缩标记。
+// truncateForBudget preserves a Unicode prefix and appends the marker used by
+// findOldestToolMsg. Content already within maxRunes is returned unchanged.
 func truncateForBudget(s string, maxRunes int) string {
 	r := []rune(s)
 	if len(r) <= maxRunes {

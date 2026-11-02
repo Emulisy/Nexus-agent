@@ -1,36 +1,35 @@
-// 记忆服务：长期记忆的管理面（列表/删除/手动抽取）（td.md §7.6，Ep 11）。
-//
-// 分层说明：抽取与召回的"算法"在 memory/long_term.Manager（网关+向量库协作），
-// 本服务只做管理面编排：归属校验、级联清理向量、按需触发抽取。
+// Memory management provides listing, archival, deletion, and manual extraction.
+// The long-term manager owns extraction/recall algorithms; this service checks
+// record/session ownership and coordinates PostgreSQL metadata with vector cleanup.
 package service
 
 import (
 	"context"
 
-	"github.com/chengpeng-cp/nexus-agent/internal/model"
 	"github.com/chengpeng-cp/nexus-agent/internal/memory/long_term"
+	"github.com/chengpeng-cp/nexus-agent/internal/model"
 	"github.com/chengpeng-cp/nexus-agent/internal/pkg/errcode"
 	"github.com/chengpeng-cp/nexus-agent/internal/pkg/pagination"
 )
 
-// memoryCollection 长期记忆向量集合（与 long_term.Manager 保持一致）。
+// memoryCollection must match the vector collection used by long_term.Manager.
 const memoryCollection = "memories"
 
-// MemoryService 记忆管理业务。
+// MemoryService manages stored memories and optionally delegates extraction to an attached manager.
 type MemoryService struct {
 	svcs    *Services
-	manager *long_term.Manager // main 注入，可 nil（未配置时功能降级）
+	manager *long_term.Manager
 }
 
-// NewMemoryService 构造。
+// NewMemoryService binds storage resources; manual extraction remains unavailable until SetManager.
 func NewMemoryService(svcs *Services) *MemoryService {
 	return &MemoryService{svcs: svcs}
 }
 
-// SetManager 注入长期记忆管理器。
+// SetManager attaches the long-term manager used by explicit extraction requests.
 func (s *MemoryService) SetManager(m *long_term.Manager) { s.manager = m }
 
-// List 用户记忆列表（管理面）。
+// List returns all caller-owned memory records, including archived entries, with pagination.
 func (s *MemoryService) List(ctx context.Context, userID int64, q pagination.Query) ([]model.Memory, int64, error) {
 	list, total, err := s.svcs.Deps.Repos.Memory.ListByUser(ctx, userID, q.Offset(), q.Limit())
 	if err != nil {
@@ -39,14 +38,16 @@ func (s *MemoryService) List(ctx context.Context, userID int64, q pagination.Que
 	return list, total, nil
 }
 
-// Delete 删除记忆：PG 行 + Milvus 向量级联清理。
+// Delete verifies record ownership and attempts to remove its vector before metadata.
+// Vector deletion is best effort; PostgreSQL deletion failures are returned as
+// internal errors rather than restoring a previously removed vector.
 func (s *MemoryService) Delete(ctx context.Context, userID, id int64) error {
 	m, err := s.svcs.Deps.Repos.Memory.Get(ctx, id)
 	if err != nil {
 		return errcode.ErrMemoryNotFound
 	}
 	if m.UserID != userID {
-		return errcode.ErrForbidden // 只能管理自己的记忆
+		return errcode.ErrForbidden
 	}
 	if s.svcs.Deps.Vector != nil {
 		_ = s.svcs.Deps.Vector.Delete(ctx, memoryCollection, []int64{id})
@@ -57,7 +58,8 @@ func (s *MemoryService) Delete(ctx context.Context, userID, id int64) error {
 	return nil
 }
 
-// Archive 归档记忆（软失效：保留数据但不再召回）。
+// Archive verifies ownership and changes the metadata status to archived.
+// The record and embedding remain stored, but active-memory lookups exclude it.
 func (s *MemoryService) Archive(ctx context.Context, userID, id int64) error {
 	m, err := s.svcs.Deps.Repos.Memory.Get(ctx, id)
 	if err != nil {
@@ -72,19 +74,20 @@ func (s *MemoryService) Archive(ctx context.Context, userID, id int64) error {
 	return nil
 }
 
-// ExtractInput 手动抽取请求。
+// ExtractInput references an existing conversation whose messages supply the extraction input.
 type ExtractInput struct {
 	SessionID string `json:"session_id"`
 }
 
-// ExtractNow 对指定会话手动执行长期记忆抽取（前端"记住这次对话"按钮）。
-// 自动抽取由 ChatService 在每 N 轮对话后异步触发，此处是管理面的补充入口。
+// ExtractNow requires an attached manager and a session owned by the caller.
+// It passes up to 20 recent user/assistant messages and the session's agent scope
+// to extraction. Empty history and extraction failures are returned to the request.
 func (s *MemoryService) ExtractNow(ctx context.Context, userID int64, in *ExtractInput) error {
 	if s.manager == nil {
-		return errcode.ErrNotImplement.WithMsg("长期记忆未启用（未配置抽取模型）")
+		return errcode.ErrNotImplement.WithMsg("Long-term memory is disabled because no extraction model is configured")
 	}
 	if in.SessionID == "" {
-		return errcode.ErrInvalidParam.WithMsg("session_id 不能为空")
+		return errcode.ErrInvalidParam.WithMsg("session_id is required")
 	}
 	repo := s.svcs.Deps.Repos.Session
 	session, err := repo.GetSession(ctx, in.SessionID)
@@ -95,13 +98,12 @@ func (s *MemoryService) ExtractNow(ctx context.Context, userID int64, in *Extrac
 		return errcode.ErrForbidden
 	}
 
-	// 取最近若干条消息作为抽取素材
 	msgs, err := repo.ListMessages(ctx, session.ID, 20)
 	if err != nil {
 		return errcode.ErrInternal.WithCause(err)
 	}
 	if len(msgs) == 0 {
-		return errcode.ErrInvalidParam.WithMsg("会话暂无可抽取的消息")
+		return errcode.ErrInvalidParam.WithMsg("The session has no messages available for memory extraction")
 	}
 	if err := s.manager.ExtractAndStore(ctx, userID, session.AgentID, historyToLLM(msgs)); err != nil {
 		return errcode.ErrInternal.WithCause(err)

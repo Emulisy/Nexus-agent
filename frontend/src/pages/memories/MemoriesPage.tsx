@@ -1,11 +1,10 @@
 /**
- * 长期记忆管理页 —— 记忆分页列表 + 归档 / 删除 + 手动触发记忆抽取。
- *
- * 职责：
- * 1. 分页展示长期记忆：内容、范围、重要度、命中统计、状态与时间线；
- * 2. 生效中的记忆可归档，任意记忆可删除（ConfirmDialog 二次确认）；
- * 3. 支持指定会话手动触发一次长期记忆抽取。
+ * Paged long-term memory management with archive, delete, and manual
+ * extraction actions. Mutations refresh server state; deleting the only row on
+ * a later page moves back one page. Extraction accepts a session ID and reloads
+ * the first result page after the server completes the request.
  */
+import '@/styles/management.css';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { clsx } from 'clsx';
 import {
@@ -24,16 +23,19 @@ import { fullTime, relativeTime } from '@/lib/format';
 import { errMsg } from '@/lib/request';
 import { toast } from '@/stores/ui';
 import { staggerEnter } from '@/lib/gsap';
+import { Icon } from '@/components/ui/Icon';
 
 const PAGE_SIZE = 20;
 
-/** 记忆范围 → Badge（user → teal / agent → violet） */
 const SCOPE_BADGE: Record<Memory['scope'], { text: string; tone: 'teal' | 'violet' }> = {
-  user: { text: '用户', tone: 'teal' },
+  user: { text: 'User', tone: 'teal' },
   agent: { text: 'Agent', tone: 'violet' },
 };
 
-/** 重要度 1-10 → 5 段小方块（每格代表 2 级）+ 数字 */
+/**
+ * Map the 1-10 importance value to five bounded segments while keeping
+ * the original numeric score visible beside the visual indicator.
+ */
 function ImportanceBar({ value }: { value: number }) {
   const filled = Math.min(5, Math.max(0, Math.ceil(value / 2)));
   return (
@@ -42,7 +44,7 @@ function ImportanceBar({ value }: { value: number }) {
         {[1, 2, 3, 4, 5].map((i) => (
           <span
             key={i}
-            className={clsx('h-1.5 w-2.5 rounded-sm', i <= filled ? 'bg-pulse' : 'bg-smoke')}
+            className={clsx('h-1.5 w-2.5 rounded-sm', i <= filled ? 'bg-lime/70' : 'bg-smoke')}
           />
         ))}
       </span>
@@ -56,16 +58,21 @@ export function MemoriesPage() {
   const [total, setTotal] = useState(0);
   const [page, setPage] = useState(1);
   const [loading, setLoading] = useState(true);
+  /** Extraction dialog state is separate from paged list requests. */
   const [extractOpen, setExtractOpen] = useState(false);
   const [sessionId, setSessionId] = useState('');
   const [extracting, setExtracting] = useState(false);
+  /** Only the targeted archive action needs row-specific pending feedback. */
   const [archivingId, setArchivingId] = useState<number | null>(null);
   const [delTarget, setDelTarget] = useState<Memory | null>(null);
   const tbodyRef = useRef<HTMLTableSectionElement>(null);
 
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
 
-  /** 拉取指定页记忆 */
+  /**
+   * Fetch one explicit page and total count. The page state remains separate
+   * so actions can refresh the current page or request the first page of results.
+   */
   const load = useCallback(async (p: number) => {
     setLoading(true);
     try {
@@ -79,12 +86,14 @@ export function MemoriesPage() {
     }
   }, []);
 
-  // 翻页 / 增删后的刷新统一走这里
   useEffect(() => {
     void load(page);
   }, [load, page]);
 
-  // 列表数据变化 → 行级交错入场（GSAP）
+  /**
+   * Animate rows after a refreshed result set mounts; stop the previous tween
+   * before a later result set replaces those elements.
+   */
   useEffect(() => {
     const els = tbodyRef.current ? Array.from(tbodyRef.current.children) : [];
     if (els.length === 0) return;
@@ -94,12 +103,15 @@ export function MemoriesPage() {
     };
   }, [list]);
 
-  /** 归档（仅生效中的记忆可操作：status 1 → 2） */
+  /**
+   * Track the target row while the server archives it, then reload the page
+   * to reflect its persisted lifecycle state.
+   */
   const doArchive = async (m: Memory) => {
     setArchivingId(m.id);
     try {
       await archiveMemory(m.id);
-      toast.ok('记忆已归档');
+      toast.ok('Memory archived');
       await load(page);
     } catch (e) {
       toast.err(errMsg(e));
@@ -108,12 +120,15 @@ export function MemoriesPage() {
     }
   };
 
-  /** 删除：当前页删空且非首页时回退一页（触发 useEffect 重新拉取） */
+  /**
+   * After deletion, move back when the last row on a later page disappears.
+   * Otherwise reload the current page to update its count and ordering.
+   */
   const confirmDelete = async () => {
     if (!delTarget) return;
     try {
       await deleteMemory(delTarget.id);
-      toast.ok('记忆已删除');
+      toast.ok('Memory deleted');
       setDelTarget(null);
       if (list.length === 1 && page > 1) {
         setPage(page - 1);
@@ -125,20 +140,23 @@ export function MemoriesPage() {
     }
   };
 
-  /** 手动触发一次长期记忆抽取 */
+  /**
+   * Require a session ID before asking the backend to extract long-term memory.
+   * Close/reset the extraction dialog on success and load the first result page.
+   */
   const doExtract = async () => {
     const sid = sessionId.trim();
     if (!sid) {
-      toast.err('请填写会话 ID');
+      toast.err('Please enter a session ID');
       return;
     }
     setExtracting(true);
     try {
       await extractMemory({ session_id: sid });
-      toast.ok('已触发记忆抽取');
+      toast.ok('Memory extraction started');
       setExtractOpen(false);
       setSessionId('');
-      await load(1); // 回到第一页查看新抽取的记忆
+      await load(1);
     } catch (e) {
       toast.err(errMsg(e));
     } finally {
@@ -147,11 +165,11 @@ export function MemoriesPage() {
   };
 
   return (
-    <div className="page-container">
+    <div className="page-container management-page">
       <PageHeader
-        title="长期记忆"
-        desc="跨会话沉淀的用户与 Agent 记忆，可归档或删除"
-        action={<Button onClick={() => setExtractOpen(true)}>记住一次对话</Button>}
+        title="Long-term memory"
+        desc="Review memories retained across conversations. Archive or delete them as needed."
+        action={<Button onClick={() => setExtractOpen(true)}>Extract conversation memories</Button>}
       />
 
       {loading ? (
@@ -160,34 +178,33 @@ export function MemoriesPage() {
         </div>
       ) : list.length === 0 ? (
         <EmptyState
-          title="暂无长期记忆"
-          hint="与 Agent 对话积累的记忆会出现在这里，也可点击右上角手动触发抽取"
+          icon={<Icon name="memory" className="h-6 w-6" />}
+          title="No memories yet"
+          hint="Memories from agent conversations appear here. You can also extract them manually."
         />
       ) : (
         <>
-          {/* 记忆列表：窄屏横向滚动 */}
           <div className="panel overflow-hidden">
             <div className="overflow-x-auto">
-              <table className="w-full text-left text-sm">
+              <table className="management-table w-full min-w-[880px] text-left text-sm">
                 <thead>
-                  <tr className="border-b border-smoke/60 text-xs tracking-wider text-ash">
-                    <th className="px-4 py-3 font-medium">记忆内容</th>
-                    <th className="px-4 py-3 font-medium">范围</th>
-                    <th className="px-4 py-3 font-medium">重要度</th>
-                    <th className="px-4 py-3 font-medium">命中</th>
-                    <th className="px-4 py-3 font-medium">最近命中</th>
-                    <th className="px-4 py-3 font-medium">状态</th>
-                    <th className="px-4 py-3 font-medium">创建时间</th>
-                    <th className="px-4 py-3 text-right font-medium">操作</th>
+                  <tr className="border-b border-smoke bg-graphite/70 text-xs tracking-wide text-fog">
+                    <th className="px-4 py-3 font-medium">Memory</th>
+                    <th className="px-4 py-3 font-medium">Scope</th>
+                    <th className="px-4 py-3 font-medium">Importance</th>
+                    <th className="px-4 py-3 font-medium">Recalls</th>
+                    <th className="px-4 py-3 font-medium">Last recalled</th>
+                    <th className="px-4 py-3 font-medium">Status</th>
+                    <th className="px-4 py-3 font-medium">Created</th>
+                    <th className="px-4 py-3 text-right font-medium">Actions</th>
                   </tr>
                 </thead>
                 <tbody ref={tbodyRef}>
                   {list.map((m) => (
                     <tr
                       key={m.id}
-                      className="border-b border-smoke/40 align-top transition-colors last:border-0 hover:bg-carbon/50"
+                      className="border-b border-smoke/60 align-top transition-colors last:border-0 hover:bg-graphite/60"
                     >
-                      {/* content 全文展示 */}
                       <td className="max-w-md whitespace-pre-wrap break-words px-4 py-3 text-mist">
                         {m.content}
                       </td>
@@ -203,12 +220,11 @@ export function MemoriesPage() {
                       <td className="px-4 py-3 text-xs text-fog">
                         {relativeTime(m.last_hit_at) || '—'}
                       </td>
-                      {/* 状态：1 生效 / 2 已归档 */}
                       <td className="px-4 py-3">
                         {m.status === 1 ? (
-                          <Badge tone="pulse">生效</Badge>
+                          <Badge tone="pulse">Active</Badge>
                         ) : (
-                          <Badge tone="gray">已归档</Badge>
+                          <Badge tone="gray">Archived</Badge>
                         )}
                       </td>
                       <td className="px-4 py-3 text-xs text-fog">{fullTime(m.created_at)}</td>
@@ -221,7 +237,7 @@ export function MemoriesPage() {
                               loading={archivingId === m.id}
                               onClick={() => void doArchive(m)}
                             >
-                              归档
+                              Archive
                             </Button>
                           )}
                           <Button
@@ -229,7 +245,7 @@ export function MemoriesPage() {
                             className="px-2.5 py-1 text-xs"
                             onClick={() => setDelTarget(m)}
                           >
-                            删除
+                            Delete
                           </Button>
                         </div>
                       </td>
@@ -240,9 +256,8 @@ export function MemoriesPage() {
             </div>
           </div>
 
-          {/* 分页条 */}
-          <div className="mt-4 flex items-center justify-between text-xs text-ash">
-            <span>共 {total} 条</span>
+          <div className="mt-5 flex flex-wrap items-center justify-between gap-3 text-xs text-ash">
+            <span>{total} {total === 1 ? 'memory' : 'memories'}</span>
             <div className="flex items-center gap-3">
               <Button
                 variant="ghost"
@@ -250,10 +265,10 @@ export function MemoriesPage() {
                 disabled={page <= 1 || loading}
                 onClick={() => setPage((p) => p - 1)}
               >
-                上一页
+                Previous
               </Button>
               <span>
-                第 {page} / {totalPages} 页
+                Page {page} of {totalPages}
               </span>
               <Button
                 variant="ghost"
@@ -261,26 +276,25 @@ export function MemoriesPage() {
                 disabled={page >= totalPages || loading}
                 onClick={() => setPage((p) => p + 1)}
               >
-                下一页
+                Next
               </Button>
             </div>
           </div>
         </>
       )}
 
-      {/* 手动抽取 Modal */}
       <Modal
         open={extractOpen}
-        title="记住一次对话"
+        title="Extract conversation memories"
         onClose={() => setExtractOpen(false)}
         width="max-w-md"
         footer={
           <>
             <Button variant="ghost" onClick={() => setExtractOpen(false)}>
-              取消
+              Cancel
             </Button>
             <Button loading={extracting} onClick={() => void doExtract()}>
-              开始抽取
+              Extract memories
             </Button>
           </>
         }
@@ -291,25 +305,24 @@ export function MemoriesPage() {
             void doExtract();
           }}
         >
-          <label className="field-label">会话 ID *</label>
+          <label className="field-label">Conversation ID *</label>
           <Input
             value={sessionId}
             onChange={(e) => setSessionId(e.target.value)}
-            placeholder="输入要抽取记忆的会话 ID"
+            placeholder="Enter the conversation ID to extract memories from"
           />
           <p className="mt-1 text-xs text-ash">
-            将对指定会话执行长期记忆抽取，结果稍后出现在列表中
+            Long-term memories will be extracted from this conversation and appear here shortly.
           </p>
         </form>
       </Modal>
 
-      {/* 删除二次确认 */}
       <ConfirmDialog
         open={delTarget !== null}
-        title="删除记忆"
-        content="删除后该条长期记忆不可恢复，确认删除？"
+        title="Delete memory"
+        content="Delete this memory? This cannot be undone."
         danger
-        confirmText="删除"
+        confirmText="Delete"
         onCancel={() => setDelTarget(null)}
         onConfirm={() => void confirmDelete()}
       />

@@ -1,4 +1,7 @@
-// Agent 与工具数据访问（实现 tool.ToolRepo 接口）。
+// Agent queries distinguish shared definitions from caller-owned definitions.
+// Read queries include owner_id IS NULL; write queries require an exact owner.
+// The tool catalog is shared and resolves the enabled bindings supplied to the
+// runtime executor, independently of these agent ownership queries.
 package repo
 
 import (
@@ -9,35 +12,17 @@ import (
 	"github.com/chengpeng-cp/nexus-agent/internal/model"
 )
 
-// AgentRepo Agent 表。
+// AgentRepo persists agent configuration and enforces owner predicates in scoped methods.
 type AgentRepo struct {
 	db *gorm.DB
 }
 
-// Create 创建 Agent。
+// Create inserts the supplied agent; the service must set ownership and required model IDs first.
 func (r *AgentRepo) Create(ctx context.Context, a *model.Agent) error {
 	return r.db.WithContext(ctx).Create(a).Error
 }
 
-// Update 更新。
-func (r *AgentRepo) Update(ctx context.Context, a *model.Agent) error {
-	return r.db.WithContext(ctx).Save(a).Error
-}
-
-// Delete 删除。
-func (r *AgentRepo) Delete(ctx context.Context, id int64) error {
-	return r.db.WithContext(ctx).Delete(&model.Agent{}, id).Error
-}
-
-// GetByID 详情（含工具绑定）。
-func (r *AgentRepo) GetByID(ctx context.Context, id int64) (*model.Agent, error) {
-	var a model.Agent
-	if err := r.db.WithContext(ctx).First(&a, id).Error; err != nil {
-		return nil, err
-	}
-	return &a, nil
-}
-
+// GetByIDForUser returns only a shared agent or one owned by the supplied user.
 func (r *AgentRepo) GetByIDForUser(ctx context.Context, id, userID int64) (*model.Agent, error) {
 	var a model.Agent
 	if err := r.db.WithContext(ctx).
@@ -48,23 +33,7 @@ func (r *AgentRepo) GetByIDForUser(ctx context.Context, id, userID int64) (*mode
 	return &a, nil
 }
 
-// List 列表（keyword 匹配名称/描述）。
-func (r *AgentRepo) List(ctx context.Context, keyword string, offset, limit int) ([]model.Agent, int64, error) {
-	var (
-		list  []model.Agent
-		total int64
-	)
-	q := r.db.WithContext(ctx).Model(&model.Agent{})
-	if keyword != "" {
-		q = q.Where("name ILIKE ? OR description ILIKE ?", "%"+keyword+"%", "%"+keyword+"%")
-	}
-	if err := q.Count(&total).Error; err != nil {
-		return nil, 0, err
-	}
-	err := q.Order("id ASC").Offset(offset).Limit(limit).Find(&list).Error
-	return list, total, err
-}
-
+// ListForUser lists shared/owned agents with optional case-insensitive name/description matching.
 func (r *AgentRepo) ListForUser(ctx context.Context, userID int64, keyword string, offset, limit int) ([]model.Agent, int64, error) {
 	var list []model.Agent
 	var total int64
@@ -80,6 +49,9 @@ func (r *AgentRepo) ListForUser(ctx context.Context, userID int64, keyword strin
 	return list, total, err
 }
 
+// UpdateForUser writes an explicit editable-field map for the owner/ID pair.
+// Using a map retains false/zero values while excluding fields outside the edit
+// contract. No matching row is returned as gorm.ErrRecordNotFound.
 func (r *AgentRepo) UpdateForUser(ctx context.Context, a *model.Agent, userID int64) error {
 	result := r.db.WithContext(ctx).Model(&model.Agent{}).
 		Where("id = ? AND owner_id = ?", a.ID, userID).
@@ -100,6 +72,7 @@ func (r *AgentRepo) UpdateForUser(ctx context.Context, a *model.Agent, userID in
 	return nil
 }
 
+// DeleteForUser deletes only an owned row and reports not-found when the owner/ID pair does not match.
 func (r *AgentRepo) DeleteForUser(ctx context.Context, id, userID int64) error {
 	result := r.db.WithContext(ctx).Where("owner_id = ?", userID).Delete(&model.Agent{}, id)
 	if result.Error != nil {
@@ -111,21 +84,7 @@ func (r *AgentRepo) DeleteForUser(ctx context.Context, id, userID int64) error {
 	return nil
 }
 
-// ListHosts 列出全部 host 类型 Agent。
-func (r *AgentRepo) ListHosts(ctx context.Context) ([]model.Agent, error) {
-	var list []model.Agent
-	err := r.db.WithContext(ctx).Where("type = ?", model.AgentTypeHost).Find(&list).Error
-	return list, err
-}
-
-// ListExpertsByHost 根据 host 的 config.experts JSON 找专家：
-// 简化实现：列出全部 expert，由 service 过滤（教学点：配置驱动路由）。
-func (r *AgentRepo) ListExperts(ctx context.Context) ([]model.Agent, error) {
-	var list []model.Agent
-	err := r.db.WithContext(ctx).Where("type = ? AND status = 1", model.AgentTypeExpert).Find(&list).Error
-	return list, err
-}
-
+// ListExpertsForUser supplies the host with all enabled expert agents that are shared or caller-owned.
 func (r *AgentRepo) ListExpertsForUser(ctx context.Context, userID int64) ([]model.Agent, error) {
 	var list []model.Agent
 	err := r.db.WithContext(ctx).
@@ -136,27 +95,17 @@ func (r *AgentRepo) ListExpertsForUser(ctx context.Context, userID int64) ([]mod
 
 // ---- Tool ----
 
-// ToolRepo 工具表（实现 tool.ToolRepo）。
+// ToolRepo stores catalog definitions; runtime handlers are held separately by the tool registry.
 type ToolRepo struct {
 	db *gorm.DB
 }
 
-// Create 创建。
+// Create inserts a tool definition and fills its generated database ID.
 func (r *ToolRepo) Create(ctx context.Context, t *model.Tool) error {
 	return r.db.WithContext(ctx).Create(t).Error
 }
 
-// Update 更新。
-func (r *ToolRepo) Update(ctx context.Context, t *model.Tool) error {
-	return r.db.WithContext(ctx).Save(t).Error
-}
-
-// Delete 删除。
-func (r *ToolRepo) Delete(ctx context.Context, id int64) error {
-	return r.db.WithContext(ctx).Delete(&model.Tool{}, id).Error
-}
-
-// GetByID 详情。
+// GetByID loads a tool catalog record by numeric ID without filtering its enabled status.
 func (r *ToolRepo) GetByID(ctx context.Context, id int64) (*model.Tool, error) {
 	var t model.Tool
 	if err := r.db.WithContext(ctx).First(&t, id).Error; err != nil {
@@ -165,7 +114,7 @@ func (r *ToolRepo) GetByID(ctx context.Context, id int64) (*model.Tool, error) {
 	return &t, nil
 }
 
-// GetByCode 按 code 查询（tool.ToolRepo 接口）。
+// GetByCode resolves a unique tool code for validation and runtime metadata lookup.
 func (r *ToolRepo) GetByCode(ctx context.Context, code string) (*model.Tool, error) {
 	var t model.Tool
 	if err := r.db.WithContext(ctx).Where("code = ?", code).First(&t).Error; err != nil {
@@ -174,21 +123,21 @@ func (r *ToolRepo) GetByCode(ctx context.Context, code string) (*model.Tool, err
 	return &t, nil
 }
 
-// ListByCodes 按 code 批量查询（tool.ToolRepo 接口）。
+// ListByCodes returns only enabled catalog records for a set of agent tool codes.
 func (r *ToolRepo) ListByCodes(ctx context.Context, codes []string) ([]model.Tool, error) {
 	var list []model.Tool
 	err := r.db.WithContext(ctx).Where("code IN ? AND status = 1", codes).Find(&list).Error
 	return list, err
 }
 
-// ListByIDs 按 ID 批量查询（Agent 绑定只带 tool_id 时回填定义用）。
+// ListByIDs resolves enabled numeric-ID bindings into the definitions used by the executor.
 func (r *ToolRepo) ListByIDs(ctx context.Context, ids []int64) ([]model.Tool, error) {
 	var list []model.Tool
 	err := r.db.WithContext(ctx).Where("id IN ? AND status = 1", ids).Find(&list).Error
 	return list, err
 }
 
-// List 工具列表。
+// List exposes catalog records with an optional type filter, stable ID ordering, and total count.
 func (r *ToolRepo) List(ctx context.Context, typ string, offset, limit int) ([]model.Tool, int64, error) {
 	var (
 		list  []model.Tool
