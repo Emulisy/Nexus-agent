@@ -1,4 +1,4 @@
-# SupaAgent
+# Nexus Agent
 
 A local agent workspace: React frontend, Go net/http API and document worker, Docker dependencies, and real model APIs. All built-in interface text and prompts are English.
 
